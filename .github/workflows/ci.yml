@@ -28,6 +28,27 @@ jobs:
         env:
           NODE_OPTIONS: --experimental-vm-modules
 
+  pi-agent:
+    name: pi-agent (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: pi-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm test
+        env:
+          NODE_OPTIONS: --experimental-vm-modules
+
   python:
     name: Python (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

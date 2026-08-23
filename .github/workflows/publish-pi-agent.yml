@@ -39,6 +39,12 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
       - name: Publish (dry run)
         if: inputs.dry_run == 'true'
         run: npm publish --dry-run --access public --provenance

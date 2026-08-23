@@ -1,8 +1,12 @@
 {
   "name": "@wechatbot/pi-agent",
   "version": "0.1.3",
-  "description": "Pi extension — type /wechat, scan QR code, chat with Pi from WeChat",
+  "description": "Pi 扩展——输入 /wechat、扫二维码，即可用微信与 Pi 对话",
   "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
   "keywords": ["pi-package"],
   "license": "MIT",
   "repository": {
@@ -23,11 +27,14 @@
     "qrcode-terminal": "^0.12.0"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*",
     "@types/node": "^22.0.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
   }
 }

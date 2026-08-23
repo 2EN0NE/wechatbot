@@ -7,6 +7,11 @@ tmp/
 next-env.d.ts
 target/
 package-lock.json
+!pi-agent/package-lock.json
+.scratch/
+.pi/logs/
+.pi/extensions-data/
+*.log
 __pycache__/
 *.pyc
 *.egg-info/
