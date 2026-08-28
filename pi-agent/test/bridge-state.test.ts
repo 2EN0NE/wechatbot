@@ -9,9 +9,8 @@ import {
   piContentToText,
   foldQueuedTurns,
   isWechatPrompt,
-  systemPromptSuffixFor,
+  systemPromptSuffix,
   formatTokens,
-  classifyCommand,
   textPreviewFor,
   gracefulStop,
 } from "../src/bridge-state.js";
@@ -227,14 +226,14 @@ describe("isWechatPrompt", () => {
   });
 });
 
-describe("systemPromptSuffixFor", () => {
-  it("adds the wechat-origin line for wechat prompts", () => {
-    const suffix = systemPromptSuffixFor("[wechat] hello");
+describe("systemPromptSuffix", () => {
+  it("adds the wechat-origin line for wechat turns", () => {
+    const suffix = systemPromptSuffix(true);
     expect(suffix).toContain("came from WeChat");
   });
 
   it("omits the wechat-origin line otherwise", () => {
-    expect(systemPromptSuffixFor("hello")).not.toContain("came from WeChat");
+    expect(systemPromptSuffix(false)).not.toContain("came from WeChat");
   });
 });
 
@@ -257,35 +256,6 @@ describe("formatTokens", () => {
 
   it("rounds larger millions", () => {
     expect(formatTokens(12000000)).toBe("12M");
-  });
-});
-
-describe("classifyCommand", () => {
-  it("detects stop with and without the slash", () => {
-    expect(classifyCommand("stop")).toBe("stop");
-    expect(classifyCommand("/stop")).toBe("stop");
-  });
-
-  it("is case-insensitive and trims", () => {
-    expect(classifyCommand("  STOP  ")).toBe("stop");
-    expect(classifyCommand("  /Compact")).toBe("compact");
-  });
-
-  it("detects /compact, /status, /help", () => {
-    expect(classifyCommand("/compact")).toBe("compact");
-    expect(classifyCommand("/status")).toBe("status");
-    expect(classifyCommand("/help")).toBe("help");
-  });
-
-  it("detects /new (new session) with slash only", () => {
-    expect(classifyCommand("/new")).toBe("new");
-    // 裸 new 不应触发，避免聊天中误判
-    expect(classifyCommand("new")).toBeNull();
-  });
-
-  it("returns null for a normal message", () => {
-    expect(classifyCommand("hello there")).toBeNull();
-    expect(classifyCommand("")).toBeNull();
   });
 });
 

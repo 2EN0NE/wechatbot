@@ -11,6 +11,7 @@ package-lock.json
 .scratch/
 .pi/logs/
 .pi/extensions-data/
+pi-agent/.pi/
 *.log
 __pycache__/
 *.pyc

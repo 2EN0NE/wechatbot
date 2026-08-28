@@ -19,6 +19,8 @@ export interface WechatTurn {
   content: PiContent;
   /** Local file paths queued via wechat_attach to send with the reply. */
   queuedAttachments: string[];
+  /** 插件命令穿透：以 expandPromptTemplates 发送（skill/prompt 展开成 turn）。 */
+  expandPromptTemplates?: boolean;
 }
 
 export const WECHAT_PREFIX = "[wechat]";
@@ -182,31 +184,10 @@ WeChat bridge extension is active.
 - If a [wechat] user asked for a file or generated artifact, use the wechat_attach tool with the local file path so the extension can send it with your next final reply.
 - Do not assume mentioning a local file path in plain text will send it to WeChat. Use wechat_attach.`;
 
-export function systemPromptSuffixFor(prompt: string): string {
-  return isWechatPrompt(prompt)
+export function systemPromptSuffix(fromWechat: boolean): string {
+  return fromWechat
     ? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from WeChat.`
     : SYSTEM_PROMPT_SUFFIX;
-}
-
-// ── inbound command classification ────────────────────────────────────
-
-export type WechatCommand =
-  | "stop"
-  | "compact"
-  | "status"
-  | "help"
-  | "new"
-  | null;
-
-/** Classify an inbound WeChat text message as a bridge command, or null for a normal turn. */
-export function classifyCommand(rawText: string): WechatCommand {
-  const lower = rawText.trim().toLowerCase();
-  if (lower === "stop" || lower === "/stop") return "stop";
-  if (lower === "/compact") return "compact";
-  if (lower === "/status") return "status";
-  if (lower === "/help") return "help";
-  if (lower === "/new") return "new";
-  return null;
 }
 
 /** One-line, length-capped preview of an inbound message, for logs (never logs full sensitive text). */

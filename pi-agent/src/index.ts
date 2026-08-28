@@ -12,6 +12,8 @@
  *   - Voice messages (transcribed text or SILK→WAV download)
  *   - Media auto-routing (image/video/file by MIME type)
  *   - Turn queue (no message lost while pi is busy), graceful abort, /status /compact /help
+ *   - Inactivity timeout (notify WeChat once when a turn stalls — adr/0006)
+ *   - Configurable command passthrough via /wechat-setting (adr/0007)
  *
  * Uses @wechatbot/wechatbot SDK for iLink protocol.
  * Uses qrcode-terminal for QR display.
@@ -21,6 +23,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  SlashCommandInfo,
 } from "@earendil-works/pi-coding-agent";
 import {
   WeChatBot,
@@ -42,9 +45,8 @@ import {
   withWechatPrefix,
   foldQueuedTurns,
   isWechatPrompt,
-  systemPromptSuffixFor,
+  systemPromptSuffix,
   formatTokens,
-  classifyCommand,
   textPreviewFor,
   gracefulStop,
   MAX_ATTACHMENTS_PER_TURN,
@@ -52,6 +54,29 @@ import {
   type WechatTurn,
 } from "./bridge-state.js";
 import { buildPiContent } from "./inbound.js";
+import {
+  classifyCommand,
+  nativeCommandById,
+  NATIVE_COMMANDS,
+  type CommandIntent,
+  type NativeCommandId,
+  type PluginSource,
+} from "./commands.js";
+import {
+  isCommandEnabled,
+  effectiveTimeoutSeconds,
+  defaultUserConfig,
+  type UserConfig,
+  type ProjectConfig,
+} from "./settings.js";
+import { loadConfigs, saveUser, saveProject } from "./config-store.js";
+import { InactivityTimer } from "./timeout.js";
+import { buildHelpText, type HelpCommandEntry } from "./help.js";
+import {
+  WechatSettingsPanel,
+  type PanelCommandItem,
+  TIMEOUT_ITEM_ID,
+} from "./panel.js";
 
 // ── File logging transport ────────────────────────────────────────────
 // pi does NOT redirect extension stderr to .pi/logs/ — stderr paints into the TUI.
@@ -116,8 +141,115 @@ export default function wechatBridge(pi: ExtensionAPI) {
   let startPromise: Promise<void> | null = null;
   let bridgeError: string | undefined;
 
+  // 配置 + 命令穿透（adr/0007）
+  let userConfig: UserConfig = defaultUserConfig();
+  let projectConfig: ProjectConfig = {};
+  let pluginSources = new Map<string, PluginSource>();
+  let pluginDescriptions = new Map<string, string>();
+
+  // 欢迎语：每次（重）连接后，某用户首条消息回发一次 /help（adr/0009）。
+  const welcomedUsers = new Set<string>();
+
+  // 不活跃超时（adr/0006）
+  let timeoutTimer: InactivityTimer | null = null;
+  let latestPartialText = "";
+
   // Bridge-side structured logging → ~/.pi/logs/wechat_<date>.log via fileTransport.
   const log = createLogger({ transport: fileTransport }).child("wechat");
+
+  // ── Config helpers ───────────────────────────────────────────────────
+
+  function enabledFor(id: string, exempt: boolean): boolean {
+    return isCommandEnabled(id, exempt, userConfig, projectConfig);
+  }
+
+  async function reloadConfig(ctx: ExtensionContext): Promise<void> {
+    const loaded = await loadConfigs(ctx.cwd);
+    userConfig = loaded.user;
+    projectConfig = loaded.project;
+    pluginSources = new Map<string, PluginSource>();
+    pluginDescriptions = new Map<string, string>();
+    for (const c of pi.getCommands()) {
+      if (c.name === "wechat" || c.name === "wechat-setting") continue;
+      if (!(await isPassthroughEligible(c))) continue;
+      pluginSources.set(c.name.toLowerCase(), c.source);
+      pluginDescriptions.set(c.name.toLowerCase(), c.description ?? "");
+    }
+  }
+
+  /** 启发式判定扩展命令是否 TUI 交互型（读源码 grep ctx.ui / select / confirm 等）。 */
+  async function isInteractiveExtension(path?: string): Promise<boolean> {
+    if (!path) return false;
+    try {
+      const src = await readFile(path, "utf-8");
+      return /ctx\.ui\.|\.select\(|\.confirm\(|\.custom\(|\.input\(|\.editor\(/.test(
+        src,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** 交互型扩展命令既不参与穿透判定也不入面板，保证展示与判定同源（adr/0007）。 */
+  async function isPassthroughEligible(c: SlashCommandInfo): Promise<boolean> {
+    if (c.source !== "extension") return true;
+    return !(await isInteractiveExtension(c.sourceInfo.path));
+  }
+
+  async function buildPanelItems(): Promise<PanelCommandItem[]> {
+    const items: PanelCommandItem[] = [
+      {
+        id: TIMEOUT_ITEM_ID,
+        name: "不活跃超时（秒）",
+        description: "无进展多久后微信提醒一次（Enter 切换）",
+        exempt: true,
+        source: "native",
+        section: "setting",
+      },
+    ];
+    for (const c of NATIVE_COMMANDS) {
+      items.push({
+        id: c.id,
+        name: c.tokens[0],
+        description: c.description,
+        exempt: c.exempt,
+        source: "native",
+        section: "native",
+      });
+    }
+    for (const c of pi.getCommands()) {
+      if (c.name === "wechat" || c.name === "wechat-setting") continue;
+      if (!(await isPassthroughEligible(c))) continue;
+      items.push({
+        id: c.name.toLowerCase(),
+        name: `/${c.name}`,
+        description: c.description ?? "",
+        exempt: false,
+        source: c.source,
+        section: "plugin",
+      });
+    }
+    return items;
+  }
+
+  // ── Inactivity timeout ───────────────────────────────────────────────
+
+  const onInactivityTimeout = () => {
+    const turn = activeTurn;
+    if (!turn) return;
+    const secs = effectiveTimeoutSeconds(userConfig, projectConfig);
+    const progress = latestPartialText
+      ? `\n\n最新进度：\n${latestPartialText}`
+      : "\n\n（尚未产生输出）";
+    void sendTextReply(
+      turn.reply,
+      `pi 处理超过 ${secs} 秒无进展，仍在处理中。${progress}\n\n如需中止，发送 stop（或 esc）。`,
+    );
+    log.info("inactivity timeout notified", {
+      userId: turn.reply.userId,
+      seconds: secs,
+    });
+  };
 
   // ── Status rendering ─────────────────────────────────────────────────
 
@@ -268,6 +400,29 @@ export default function wechatBridge(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
+  function helpText(): string {
+    const native: HelpCommandEntry[] = [];
+    for (const c of NATIVE_COMMANDS) {
+      if (!enabledFor(c.id, c.exempt)) continue;
+      native.push({
+        trigger: c.id === "stop" ? "/stop（esc）" : c.tokens[0],
+        description: c.description,
+      });
+    }
+    const plugin: HelpCommandEntry[] = [...pluginSources.keys()]
+      .filter((name) => enabledFor(name, false))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => ({
+        trigger: `/${name}`,
+        description: pluginDescriptions.get(name) ?? "",
+      }));
+    return buildHelpText({
+      timeoutSeconds: effectiveTimeoutSeconds(userConfig, projectConfig),
+      native,
+      plugin,
+    });
+  }
+
   // ── Turn construction ────────────────────────────────────────────────
 
   async function buildWechatTurn(
@@ -299,7 +454,12 @@ export default function wechatBridge(pi: ExtensionAPI) {
 
     for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
       try {
-        await pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+        await pi.sendUserMessage(turn.content, {
+          deliverAs: "followUp",
+          ...(turn.expandPromptTemplates
+            ? { expandPromptTemplates: true }
+            : {}),
+        });
         log.debug("sent turn to pi", { userId: turn.reply.userId });
         return;
       } catch (e) {
@@ -330,6 +490,155 @@ export default function wechatBridge(pi: ExtensionAPI) {
     }
   }
 
+  // ── Native command handlers ──────────────────────────────────────────
+
+  async function handleNativeCommand(
+    id: NativeCommandId,
+    msg: IncomingMessage,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    const cmd = nativeCommandById(id);
+    if (!enabledFor(id, cmd.exempt)) {
+      await sendTextReply(
+        msg,
+        `命令 /${id} 未在微信端启用（用 /wechat-setting 配置）。`,
+      );
+      return;
+    }
+
+    switch (id) {
+      case "stop": {
+        if (currentAbort) {
+          if (pendingTurns.length > 0) {
+            preserveQueuedTurnsAsHistory = true;
+          }
+          currentAbort();
+          updateStatus(ctx);
+          await sendTextReply(msg, "Aborted current turn.");
+        } else {
+          await sendTextReply(msg, "No active turn.");
+        }
+        return;
+      }
+      case "compact": {
+        if (!ctx.isIdle()) {
+          await sendTextReply(
+            msg,
+            'Cannot compact while pi is busy. Send "stop" first.',
+          );
+          return;
+        }
+        ctx.compact({
+          onComplete: () => {
+            void sendTextReply(msg, "Compaction completed.");
+          },
+          onError: (error) => {
+            void sendTextReply(
+              msg,
+              `Compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          },
+        });
+        await sendTextReply(msg, "Compaction started.");
+        return;
+      }
+      case "status": {
+        await sendTextReply(msg, await buildStatusText(ctx));
+        return;
+      }
+      case "new": {
+        if (!ctx.isIdle()) {
+          await sendTextReply(
+            msg,
+            'Cannot start a new session while pi is busy. Send "stop" first.',
+          );
+          return;
+        }
+        await sendTextReply(
+          msg,
+          "Starting a new session — the bridge will reconnect automatically…",
+        );
+        restartAfterReplace = true;
+        pendingAck = {
+          reply: msg,
+          text: "New session started. Previous conversation archived; WeChat connection restored.",
+        };
+        try {
+          await ctx.newSession();
+        } catch (e) {
+          restartAfterReplace = false;
+          pendingAck = null;
+          await sendTextReply(
+            msg,
+            `Failed to start new session: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+        return;
+      }
+      case "help": {
+        await sendTextReply(msg, helpText());
+        return;
+      }
+    }
+  }
+
+  // ── Plugin command passthrough ───────────────────────────────────────
+
+  async function handlePluginCommand(
+    intent: Extract<CommandIntent, { kind: "plugin" }>,
+    msg: IncomingMessage,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    if (!enabledFor(intent.name, false)) {
+      await sendTextReply(
+        msg,
+        `命令 /${intent.name} 未在微信端启用（用 /wechat-setting 配置）。`,
+      );
+      return;
+    }
+
+    if (intent.source === "extension") {
+      // 扩展命令：执行其 handler，输出走 ctx.ui / pi.sendMessage，回不到微信。
+      // sendUserMessage 返回 Promise，分发失败是异步的——只有 await 后才能观察、
+      // 并把失败转成边界安全的微信回执；否则 rejection 会变成未处理拒绝。
+      try {
+        await pi.sendUserMessage(intent.raw, { expandPromptTemplates: true });
+      } catch (e) {
+        await sendTextReply(
+          msg,
+          `扩展命令执行失败：${e instanceof Error ? e.message : String(e)}`,
+        );
+        return;
+      }
+      await sendTextReply(
+        msg,
+        `已触发扩展命令 /${intent.name}。其输出在 pi 终端，可能不会回传微信。`,
+      );
+      updateStatus(ctx);
+      return;
+    }
+
+    // skill / prompt：展开成普通 turn，回复自然回微信。入队与普通消息一致。
+    const turn: WechatTurn = {
+      reply: msg,
+      content: intent.raw,
+      queuedAttachments: [],
+      expandPromptTemplates: true,
+    };
+    pendingTurns.push(turn);
+    try {
+      await bot!.sendTyping(msg.userId);
+    } catch {
+      /* non-fatal */
+    }
+    if (activeTurn) {
+      log.debug("queued plugin command", { queued: pendingTurns.length });
+    } else {
+      await pumpTurn();
+    }
+    updateStatus(ctx);
+  }
+
   // ── Message dispatch (command interception + queue) ──────────────────
 
   async function dispatchMessage(
@@ -343,90 +652,42 @@ export default function wechatBridge(pi: ExtensionAPI) {
       });
       return;
     }
-    const command = classifyCommand(msg.text ?? "");
-    log.info(command ? `command: ${command}` : "message received", {
-      userId: msg.userId,
-      type: msg.type,
-      preview: textPreviewFor({ text: msg.text, type: msg.type }),
-    });
+    const intent = classifyCommand(msg.text ?? "", pluginSources);
 
-    if (command === "stop") {
-      if (currentAbort) {
-        if (pendingTurns.length > 0) {
-          preserveQueuedTurnsAsHistory = true;
+    // 每次（重）连接后，该用户首条消息回发一次 /help 欢迎语；若首条消息本身就是
+    // /help，则直接交给下方处理，避免连发两份（adr/0009）。
+    if (!welcomedUsers.has(msg.userId)) {
+      welcomedUsers.add(msg.userId);
+      if (!(intent.kind === "native" && intent.id === "help")) {
+        try {
+          await sendTextReply(msg, helpText());
+        } catch (e) {
+          log.warn("welcome message failed", {
+            userId: msg.userId,
+            error: String(e),
+          });
         }
-        currentAbort();
-        updateStatus(ctx);
-        await sendTextReply(msg, "Aborted current turn.");
-      } else {
-        await sendTextReply(msg, "No active turn.");
       }
-      return;
     }
 
-    if (command === "compact") {
-      if (!ctx.isIdle()) {
-        await sendTextReply(
-          msg,
-          'Cannot compact while pi is busy. Send "stop" first.',
-        );
-        return;
-      }
-      ctx.compact({
-        onComplete: () => {
-          void sendTextReply(msg, "Compaction completed.");
-        },
-        onError: (error) => {
-          void sendTextReply(
-            msg,
-            `Compaction failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        },
-      });
-      await sendTextReply(msg, "Compaction started.");
+    log.info(
+      intent.kind === "message"
+        ? "message received"
+        : `command: ${intent.kind === "native" ? intent.id : `plugin:${intent.name}`}`,
+      {
+        userId: msg.userId,
+        type: msg.type,
+        preview: textPreviewFor({ text: msg.text, type: msg.type }),
+      },
+    );
+
+    if (intent.kind === "native") {
+      await handleNativeCommand(intent.id, msg, ctx);
+      updateStatus(ctx);
       return;
     }
-
-    if (command === "status") {
-      await sendTextReply(msg, await buildStatusText(ctx));
-      return;
-    }
-
-    if (command === "new") {
-      if (!ctx.isIdle()) {
-        await sendTextReply(
-          msg,
-          'Cannot start a new session while pi is busy. Send "stop" first.',
-        );
-        return;
-      }
-      await sendTextReply(
-        msg,
-        "Starting a new session — the bridge will reconnect automatically…",
-      );
-      restartAfterReplace = true;
-      pendingAck = {
-        reply: msg,
-        text: "New session started. Previous conversation archived; WeChat connection restored.",
-      };
-      try {
-        await ctx.newSession();
-      } catch (e) {
-        restartAfterReplace = false;
-        pendingAck = null;
-        await sendTextReply(
-          msg,
-          `Failed to start new session: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-      return;
-    }
-
-    if (command === "help") {
-      await sendTextReply(
-        msg,
-        "Send me a message and I will forward it to pi. Commands: /status, /compact, /new, /help, stop.",
-      );
+    if (intent.kind === "plugin") {
+      await handlePluginCommand(intent, msg, ctx);
       return;
     }
 
@@ -456,16 +717,42 @@ export default function wechatBridge(pi: ExtensionAPI) {
   // ── Lifecycle events ─────────────────────────────────────────────────
 
   pi.on("before_agent_start", async (event) => {
-    if (!isWechatPrompt(event.prompt ?? "")) return;
+    const fromWechat =
+      isWechatPrompt(event.prompt ?? "") || activeTurn !== null;
+    if (!fromWechat) return;
     return {
-      systemPrompt:
-        event.systemPrompt + systemPromptSuffixFor(event.prompt ?? ""),
+      systemPrompt: event.systemPrompt + systemPromptSuffix(fromWechat),
     };
   });
 
   pi.on("agent_start", async (_event, ctx) => {
     currentAbort = () => ctx.abort();
+    latestPartialText = "";
+    // 前一轮的 agent_end 可能因 auto-retry/auto-compact 又触发一次 agent_start；
+    // 覆盖前先 disarm 旧计时器，避免孤儿计时器在下一轮误报“无进展”。
+    timeoutTimer?.disarm();
+    const timeoutMs = effectiveTimeoutSeconds(userConfig, projectConfig) * 1000;
+    timeoutTimer = new InactivityTimer(timeoutMs, onInactivityTimeout);
+    timeoutTimer.arm();
     updateStatus(ctx);
+  });
+
+  pi.on("message_update", async (event) => {
+    timeoutTimer?.touch();
+    const text = extractAssistantText([event.message]).text;
+    if (text) latestPartialText = text;
+  });
+
+  pi.on("tool_execution_start", async () => {
+    timeoutTimer?.touch();
+  });
+
+  pi.on("tool_execution_update", async () => {
+    timeoutTimer?.touch();
+  });
+
+  pi.on("tool_execution_end", async () => {
+    timeoutTimer?.touch();
   });
 
   pi.on("agent_end", async (event, ctx) => {
@@ -477,6 +764,8 @@ export default function wechatBridge(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    timeoutTimer?.disarm();
+    timeoutTimer = null;
     const turn = activeTurn;
     activeTurn = null;
     const summary = lastEndSummary;
@@ -597,6 +886,46 @@ export default function wechatBridge(pi: ExtensionAPI) {
     },
   });
 
+  // ── /wechat-setting command ──────────────────────────────────────────
+
+  const openSettings = async (
+    _args: string | undefined,
+    ctx: ExtensionCommandContext,
+  ) => {
+    await reloadConfig(ctx);
+    const items = await buildPanelItems();
+    await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+      const panel = new WechatSettingsPanel({
+        items,
+        user: userConfig,
+        project: projectConfig,
+        theme,
+        keys: keybindings,
+        requestRender: () => tui.requestRender(),
+        done: () => done(undefined),
+        saveUser: (c) => {
+          void saveUser(c).catch((e) =>
+            log.error("save user config failed", { error: String(e) }),
+          );
+        },
+        saveProject: (c) => {
+          void saveProject(ctx.cwd, c).catch((e) =>
+            log.error("save project config failed", { error: String(e) }),
+          );
+        },
+      });
+      return panel;
+    });
+    // 面板关闭后重载，让运行时立即用上新配置。
+    await reloadConfig(ctx);
+    log.info("wechat settings updated", { cwd: ctx.cwd });
+  };
+
+  pi.registerCommand("wechat-setting", {
+    description: "配置微信端命令穿透与不活跃超时",
+    handler: openSettings,
+  });
+
   // ── /wechat command ──────────────────────────────────────────────────
 
   const startWechat = async (_args: string | undefined, ctx: any) => {
@@ -662,7 +991,11 @@ export default function wechatBridge(pi: ExtensionAPI) {
       connected = true;
       connecting = false;
       bridgeError = undefined;
-      ctx.ui.notify(`WeChat connected!\nAccount: ${creds.accountId}`, "info");
+      welcomedUsers.clear();
+      ctx.ui.notify(
+        `WeChat connected!\nAccount: ${creds.accountId}\n\n${helpText()}`,
+        "info",
+      );
       log.info("connected", { accountId: creds.accountId });
 
       bot.onMessage(async (msg: IncomingMessage) => {
@@ -724,10 +1057,13 @@ export default function wechatBridge(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    timeoutTimer?.disarm();
+    timeoutTimer = null;
     await shutdownBot();
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    await reloadConfig(ctx);
     if (restartAfterReplace) {
       restartAfterReplace = false;
       // 新会话已就绪：用存储的凭证免扫码重登，恢复桥接。
