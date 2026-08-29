@@ -61,6 +61,5 @@
 ## 版本策略
 
 - 仓库级 changelog 版本与各子包（pi-agent、nodejs、python、golang、rust）的 package 版本是两套独立体系，互不耦合。
-- 发版触发：push `v*` tag（现有 `release-binaries.yml` / `publish-*.yml`）。
-- 现状：release notes 由 GitHub 自动生成（`softprops/action-gh-release` 的 `generate_release_notes`）。
-- 待办（可选）：切换到 CHANGELOG 驱动的 release notes（nano-pi-agent-creator 式，从 `CHANGELOG.md` 提取 `## vX.Y.Z` 段落），需改造 `release-binaries.yml` 的 release 步骤。
+- 发版触发：push `v*` tag → `release.yml` 从 `CHANGELOG.md` 提取 `## vX.Y.Z` 段落作为 release notes，创建 GitHub release。
+- 各语言 SDK / pi-agent 的 npm / PyPI / crate 发布流程已移除（当前纯自用，仅保留 CI 与 release）。
