@@ -25,6 +25,7 @@ import type {
   ExtensionContext,
   SlashCommandInfo,
 } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   WeChatBot,
   createLogger,
@@ -35,6 +36,7 @@ import {
 } from "@wechatbot/wechatbot";
 import { Type } from "typebox";
 import qrTerminal from "qrcode-terminal";
+import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
@@ -54,6 +56,8 @@ import {
   type WechatTurn,
 } from "./bridge-state.js";
 import { buildPiContent } from "./inbound.js";
+import { authorizationState } from "./authorize.js";
+import { createJournal } from "./journal.js";
 import {
   classifyCommand,
   nativeCommandById,
@@ -156,6 +160,12 @@ export default function wechatBridge(pi: ExtensionAPI) {
 
   // Bridge-side structured logging → ~/.pi/logs/wechat_<date>.log via fileTransport.
   const log = createLogger({ transport: fileTransport }).child("wechat");
+
+  // 桥接层薄 journal（adr/0011）：文本轮次的持久准入与崩溃回放。
+  const journal = createJournal(
+    join(getAgentDir(), "wechat-journal.jsonl"),
+    (e) => log.error("journal error", { error: String(e) }),
+  );
 
   // ── Config helpers ───────────────────────────────────────────────────
 
@@ -476,9 +486,10 @@ export default function wechatBridge(pi: ExtensionAPI) {
           continue;
         }
         // 最终失败：丢弃该 turn（不再 unshift 否则会无限重试同一条），
-        // 通知微信用户并置错误状态。
+        // 通知微信用户并置错误状态。写 settled 标记生命周期终结（adr/0011）。
         activeTurn = null;
         bridgeError = error;
+        if (turn.turnId) await journal.settle(turn.turnId);
         log.error("failed to send turn to pi after retries", {
           userId: turn.reply.userId,
           attempts: MAX_SEND_ATTEMPTS,
@@ -487,6 +498,38 @@ export default function wechatBridge(pi: ExtensionAPI) {
         await notifySendFailure(turn, error);
         return;
       }
+    }
+  }
+
+  // 崩溃回放（adr/0011）：重放 journal 中「有 admitted 无 settled」的文本 turn。
+  // 回放的 turn 已 admitted（即已授权），绕过鉴权与欢迎语，直接入队处理。
+  async function replayJournalTurns(): Promise<void> {
+    const entries = await journal.replayUnsettled();
+    for (const entry of entries) {
+      const msg: IncomingMessage = {
+        userId: entry.userId,
+        text: entry.text,
+        type: "text",
+        timestamp: new Date(entry.timestamp || Date.now()),
+        images: [],
+        voices: [],
+        files: [],
+        videos: [],
+        // SAFETY: 文本回放不访问 raw——buildPiContent 对 type === "text" 直接返回 msg.text。
+        raw: {} as unknown as IncomingMessage["raw"],
+        _contextToken: entry.contextToken,
+      };
+      const turn = await buildWechatTurn(msg);
+      turn.turnId = entry.turnId;
+      pendingTurns.push(turn);
+      log.info("replayed turn from journal", {
+        turnId: entry.turnId,
+        userId: entry.userId,
+      });
+    }
+    await journal.compact();
+    if (activeTurn === null && pendingTurns.length > 0) {
+      await pumpTurn();
     }
   }
 
@@ -619,6 +662,8 @@ export default function wechatBridge(pi: ExtensionAPI) {
     }
 
     // skill / prompt：展开成普通 turn，回复自然回微信。入队与普通消息一致。
+    // 不纳入 journal（adr/0011 仅覆盖对话型文本）：命令可重发，且回放需恢复
+    // expandPromptTemplates 语义、复杂度不值。
     const turn: WechatTurn = {
       reply: msg,
       content: intent.raw,
@@ -652,6 +697,27 @@ export default function wechatBridge(pi: ExtensionAPI) {
       });
       return;
     }
+
+    // 发送者白名单鉴权（adr/0010）：未授权静默丢弃，只记脱敏日志、不回任何内容；
+    // 首用户配对则持久化 allowedUserId，此后白名单锁定、不再自动配对。
+    const auth = authorizationState(msg.userId, userConfig.allowedUserId);
+    if (auth.kind === "deny") {
+      log.warn("message dropped — sender not authorized", {
+        userId: msg.userId,
+        preview: textPreviewFor({ text: msg.text, type: msg.type }),
+      });
+      return;
+    }
+    if (auth.kind === "pair") {
+      userConfig = { ...userConfig, allowedUserId: auth.userId };
+      void saveUser(userConfig).catch((e) =>
+        log.error("persist allowedUserId failed", { error: String(e) }),
+      );
+      log.info("paired first sender as authorized user", {
+        userId: auth.userId,
+      });
+    }
+
     const intent = classifyCommand(msg.text ?? "", pluginSources);
 
     // 每次（重）连接后，该用户首条消息回发一次 /help 欢迎语；若首条消息本身就是
@@ -697,7 +763,25 @@ export default function wechatBridge(pi: ExtensionAPI) {
       ? pendingTurns.splice(0)
       : [];
     preserveQueuedTurnsAsHistory = false;
+
+    // 被折叠的积压 turn 生命周期终结：写 settled，避免崩溃回放重复处理（adr/0011）。
+    for (const folded of historyTurns) {
+      if (folded.turnId) await journal.settle(folded.turnId);
+    }
+
+    // 文本消息先持久准入（admitted）再入队；journal 写失败不阻断（尽力而为）。
     const turn = await buildWechatTurn(msg, historyTurns);
+    if (msg.type === "text") {
+      turn.turnId = randomUUID();
+      await journal.admit({
+        turnId: turn.turnId,
+        userId: msg.userId,
+        text: msg.text,
+        type: "text",
+        contextToken: msg._contextToken,
+        timestamp: msg.timestamp.toISOString(),
+      });
+    }
     pendingTurns.push(turn);
 
     try {
@@ -782,6 +866,14 @@ export default function wechatBridge(pi: ExtensionAPI) {
     }
 
     const action = replyActionFor(summary ?? {});
+    // 该动作是否承载「用户必须收到」的回发内容：reply / error 必然回发文字，
+    // silent 仅当有待发附件时才回发提示。aborted 与纯 silent 无回发，stopTyping
+    // 失败不影响结算。
+    const hasReplyDeliverable =
+      action.kind === "error" ||
+      action.kind === "reply" ||
+      (action.kind === "silent" && turn.queuedAttachments.length > 0);
+    let replyDelivered = false;
     try {
       switch (action.kind) {
         case "aborted":
@@ -803,6 +895,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
           }
           break;
       }
+      replyDelivered = true;
       // Reply round-trip succeeded — the bridge is healthy. Clear any transient
       // error left by bot.on("error") (poller/handler noise) so status self-heals.
       bridgeError = undefined;
@@ -816,6 +909,13 @@ export default function wechatBridge(pi: ExtensionAPI) {
         userId: turn.reply.userId,
         error: bridgeError,
       });
+    }
+
+    // turn 生命周期终结：回复成功 / 中止 / 静默 → 写 settled。唯一例外是「有回发
+    // 内容但发送失败」——此时保留 unsettled，崩溃回放会重新处理，保证至少一次送达
+    //（adr/0011）。
+    if (turn.turnId && (!hasReplyDeliverable || replyDelivered)) {
+      await journal.settle(turn.turnId);
     }
 
     // Advance the queue — unless a "stop" folded the backlog into the next
@@ -904,7 +1004,13 @@ export default function wechatBridge(pi: ExtensionAPI) {
         requestRender: () => tui.requestRender(),
         done: () => done(undefined),
         saveUser: (c) => {
-          void saveUser(c).catch((e) =>
+          // 面板持有打开时的快照；配对（adr/0010）可能在面板打开期间把
+          // allowedUserId 写入内存，合并最新值避免用陈旧快照覆盖白名单锁定。
+          const merged: UserConfig = {
+            ...c,
+            allowedUserId: userConfig.allowedUserId,
+          };
+          void saveUser(merged).catch((e) =>
             log.error("save user config failed", { error: String(e) }),
           );
         },
@@ -1010,6 +1116,10 @@ export default function wechatBridge(pi: ExtensionAPI) {
       bot.on("session:expired", () => {
         bridgeError = "Session expired — re-login…";
         log.warn("session expired — re-login required");
+        // session 过期后 context_token 被平台清除（docs/protocol.md），journal
+        // 中未结算的 turn 已无法回放（回复会因失效 token 路由失败）。清空之，
+        // 避免用失效 token 重放（adr/0011）。
+        void journal.discard();
         updateStatus(ctx);
       });
       bot.on("session:restored", () => {
@@ -1022,6 +1132,9 @@ export default function wechatBridge(pi: ExtensionAPI) {
         connected = false;
         updateStatus(ctx);
       });
+
+      // 崩溃回放：重连成功后重放未结算的文本 turn（adr/0011）。
+      await replayJournalTurns();
 
       updateStatus(ctx);
     } catch (e) {

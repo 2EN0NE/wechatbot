@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, writeFile, appendFile } from "node:fs/promises";
 
 // ── 模块 mock ──────────────────────────────────────────────────────────
 const h = vi.hoisted(() => ({ bots: [] as any[] }));
@@ -159,6 +159,237 @@ afterEach(() => {
 
 // ── 用例 ───────────────────────────────────────────────────────────────
 
+describe("发送者白名单鉴权（ADR-0010）", () => {
+  beforeEach(() => {
+    vi.mocked(writeFile).mockClear();
+  });
+
+  it("首用户配对：持久化 allowedUserId 并回发欢迎语", async () => {
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello owner"));
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(bot().reply).toHaveBeenCalled(); // 欢迎语
+    // saveUser 持久化 allowedUserId 到用户级 wechatbot.json
+    await vi.waitFor(() => {
+      expect(vi.mocked(writeFile)).toHaveBeenCalled();
+    });
+    const saved = vi
+      .mocked(writeFile)
+      .mock.calls.find((c) => String(c[0]).endsWith("wechatbot.json"));
+    expect(saved).toBeTruthy();
+    expect(String(saved![1])).toContain("allowedUserId");
+    expect(String(saved![1])).toContain("user1");
+  });
+
+  it("未授权发送者被静默丢弃：不处理、不回复、无欢迎语", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    vi.mocked(readFile).mockImplementation(async () =>
+      JSON.stringify({ allowedUserId: "owner" }),
+    );
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx); // reloadConfig 加载 allowedUserId
+    const onMsg = bot().onMessageCb;
+
+    const stranger = makeMsg("hello stranger");
+    stranger.userId = "stranger";
+    await onMsg(stranger);
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(bot().reply).not.toHaveBeenCalled();
+  });
+
+  it("白名单内的发送者正常处理", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    vi.mocked(readFile).mockImplementation(async () =>
+      JSON.stringify({ allowedUserId: "user1" }),
+    );
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello authorized"));
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("未授权发送者的命令（含豁免命令）同样被静默丢弃", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    vi.mocked(readFile).mockImplementation(async () =>
+      JSON.stringify({ allowedUserId: "owner" }),
+    );
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx); // reloadConfig 加载 allowedUserId
+    const onMsg = bot().onMessageCb;
+
+    // /new 是豁免命令（恒可用、不可关闭），/status 是默认关闭原生命令——
+    // 二者都应被白名单拦截，证明鉴权优先级高于命令豁免，陌生人无法以宿主权限触发命令。
+    for (const text of ["/new", "/status"]) {
+      const stranger = makeMsg(text);
+      stranger.userId = "stranger";
+      await onMsg(stranger);
+    }
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(bot().reply).not.toHaveBeenCalled();
+    expect(ctx.newSession).not.toHaveBeenCalled(); // /new 未触发会话重建
+  });
+
+  it("配对后第二个不同发送者立即被拒绝（无需等待落盘）", async () => {
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello owner")); // 未设 allowedUserId → user1 配对并持久化
+
+    const stranger = makeMsg("hello stranger");
+    stranger.userId = "stranger";
+    await onMsg(stranger);
+
+    // 配对后内存态立即锁定：仅 owner 被处理一次（另加一次欢迎语），陌生人被拒。
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(bot().reply).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("桥接层薄 journal（ADR-0011）", () => {
+  beforeEach(() => {
+    vi.mocked(appendFile).mockClear();
+  });
+
+  it("文本消息入队前写 admitted，回复成功后写 settled", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello journal"));
+
+    const admitCall = vi
+      .mocked(appendFile)
+      .mock.calls.find(
+        (c) =>
+          String(c[0]).endsWith("wechat-journal.jsonl") &&
+          String(c[1]).includes('"kind":"admitted"'),
+      );
+    expect(admitCall).toBeTruthy();
+    expect(String(admitCall![1])).toContain("hello journal");
+
+    await fire(
+      handlers,
+      "agent_end",
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "reply" }] },
+        ],
+      },
+      ctx,
+    );
+    await fire(handlers, "agent_settled", {}, ctx);
+
+    const settleCall = vi
+      .mocked(appendFile)
+      .mock.calls.find(
+        (c) =>
+          String(c[0]).endsWith("wechat-journal.jsonl") &&
+          String(c[1]).includes('"kind":"settled"'),
+      );
+    expect(settleCall).toBeTruthy();
+  });
+
+  it("重连后回放未结算的文本 turn，不触发欢迎语", async () => {
+    const { pi, commands } = makeFakePi();
+    vi.mocked(readFile).mockImplementation(async (path: any) => {
+      const p = String(path);
+      if (p.endsWith("wechat-journal.jsonl")) {
+        return (
+          JSON.stringify({
+            kind: "admitted",
+            turnId: "t1",
+            userId: "user1",
+            text: "replayed hello",
+            type: "text",
+            contextToken: "ct",
+            timestamp: "",
+          }) + "\n"
+        );
+      }
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("[wechat] replayed hello", {
+      deliverAs: "followUp",
+    });
+    expect(bot().reply).not.toHaveBeenCalled();
+  });
+
+  it("会话关闭后 in-flight turn 不写 settled，留待重连回放", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello before crash")); // admit + in-flight，尚未 settle
+
+    // 模拟崩溃/会话关闭：shutdownBot 清空 activeTurn 与 pendingTurns，但不结算 journal。
+    await fire(handlers, "session_shutdown", {}, ctx);
+
+    // in-flight turn 未被结算：journal 保留「有 admitted 无 settled」，供重连回放。
+    const settled = vi
+      .mocked(appendFile)
+      .mock.calls.some(
+        (c) =>
+          String(c[0]).endsWith("wechat-journal.jsonl") &&
+          String(c[1]).includes('"kind":"settled"'),
+      );
+    expect(settled).toBe(false);
+  });
+
+  it("回复发送失败不写 settled，留待崩溃回放（P1 回归）", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello reply-fail")); // 配对 + 欢迎语 + admit + in-flight
+
+    // 之后让回复发送（bot.reply）失败一次，模拟网络故障。
+    bot().reply.mockRejectedValueOnce(new Error("network down"));
+
+    await fire(
+      handlers,
+      "agent_end",
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "reply" }] },
+        ],
+      },
+      ctx,
+    );
+    await fire(handlers, "agent_settled", {}, ctx);
+
+    // 回发失败：不写 settled，admitted 仍在，崩溃回放会重新处理（至少一次）。
+    const settled = vi
+      .mocked(appendFile)
+      .mock.calls.some(
+        (c) =>
+          String(c[0]).endsWith("wechat-journal.jsonl") &&
+          String(c[1]).includes('"kind":"settled"'),
+      );
+    expect(settled).toBe(false);
+  });
+});
+
 describe("turn 串行化（核心链路）", () => {
   it("一次一条 in-flight，agent_settled 回复后推进队列", async () => {
     const { pi, handlers, commands } = makeFakePi();
@@ -212,6 +443,7 @@ describe("turn 串行化（核心链路）", () => {
   });
 
   it("stop 中止当前轮次并把积压折叠进下一条", async () => {
+    vi.mocked(appendFile).mockClear();
     const { pi, handlers, commands } = makeFakePi();
     const ctx = makeFakeCtx();
     await connect(pi, commands, ctx);
@@ -240,6 +472,54 @@ describe("turn 串行化（核心链路）", () => {
     expect(content).toContain("hello C");
     expect(content).toContain("Current WeChat message:");
     expect(content).toContain("hello D");
+
+    // 折叠的 B/C 与 aborted 的 A 均写 settled（终结路径全覆盖，adr/0011）。
+    const settleCalls = vi
+      .mocked(appendFile)
+      .mock.calls.filter(
+        (c) =>
+          String(c[0]).endsWith("wechat-journal.jsonl") &&
+          String(c[1]).includes('"kind":"settled"'),
+      );
+    expect(settleCalls).toHaveLength(3);
+  });
+
+  it("agent_end 多次触发只回复一次，取最后一次 summary", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    const msg = makeMsg("hello");
+    await onMsg(msg);
+
+    await fire(
+      handlers,
+      "agent_end",
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "partial A" }] },
+        ],
+      },
+      ctx,
+    );
+    await fire(
+      handlers,
+      "agent_end",
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "final B" }] },
+        ],
+      },
+      ctx,
+    );
+    await fire(handlers, "agent_settled", {}, ctx);
+
+    expect(bot().reply).toHaveBeenCalledWith(msg, "final B");
+    const finalReplies = bot().reply.mock.calls.filter(
+      (c: any[]) => c[1] === "final B",
+    );
+    expect(finalReplies).toHaveLength(1);
   });
 });
 
@@ -359,6 +639,7 @@ describe("不活跃超时接线", () => {
 describe("sendUserMessage 重试", () => {
   it("指数退避重试，最终失败丢弃并通知微信用户", async () => {
     vi.useFakeTimers();
+    vi.mocked(appendFile).mockClear();
     const { pi, commands } = makeFakePi();
     pi.sendUserMessage.mockRejectedValue(new Error("boom"));
     const ctx = makeFakeCtx();
@@ -372,6 +653,16 @@ describe("sendUserMessage 重试", () => {
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(4);
     expect(bot().reply).toHaveBeenCalledWith(msg, "消息处理失败：boom");
+
+    // 最终失败也写 settled，避免崩溃回放无限重试同一条已终结 turn（adr/0011）。
+    const settleCall = vi
+      .mocked(appendFile)
+      .mock.calls.find(
+        (c) =>
+          String(c[0]).endsWith("wechat-journal.jsonl") &&
+          String(c[1]).includes('"kind":"settled"'),
+      );
+    expect(settleCall).toBeTruthy();
   });
 });
 
@@ -403,6 +694,24 @@ describe("wechat_attach 工具", () => {
     });
     expect(result.content[0].text).toContain("2");
     expect(result.details.paths).toEqual(["/a.txt", "/b.txt"]);
+  });
+
+  it("附件超过上限时拒绝", async () => {
+    const { pi, commands, tools } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+    const attach = tools.find((t) => t.name === "wechat_attach");
+
+    await onMsg(makeMsg("hello")); // 建立活动轮次
+    vi.mocked(stat).mockResolvedValue({ isFile: () => true } as any);
+
+    const ten = Array.from({ length: 10 }, (_, i) => `/a${i + 1}.txt`);
+    await attach.execute("id", { paths: ten });
+
+    await expect(
+      attach.execute("id", { paths: ["/overflow.txt"] }),
+    ).rejects.toThrow("Attachment limit reached");
   });
 });
 

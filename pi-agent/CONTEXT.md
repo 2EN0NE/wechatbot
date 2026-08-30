@@ -51,3 +51,23 @@ _Avoid_: option, preference, config item
 **Welcome message（欢迎语）**：
 每次（重）连接后，某微信用户首条入站消息触发的一次性 `/help` 回发；同一连接期内该用户至多收到一次。用于规避「无 context_token 无法主动推送」的平台限制。
 _Avoid_: greeting, onboarding message
+
+**Sender allowlist（发送者白名单）**：
+桥入口的鉴权策略：只有白名单内的 wxid 能触发轮次，其余默认拒绝。当前至多一个 wxid（即授权发送者）。
+_Avoid_: whitelist, authorized list
+
+**Pairing（配对）**：
+白名单为空时，首个发消息的 wxid 被授权为授权发送者的过程；配对成功即持久化该 wxid，此后白名单锁定，不再自动配对。
+_Avoid_: bind, enroll
+
+**Durable admission（持久准入）**：
+文本轮次交给 pi 前先把「已收」记录原子落盘，崩溃恢复后据此回放未结算轮次。与 Settle 相对。
+_Avoid_: checkpoint, ack
+
+**Settle（结算）**：
+轮次回复成功发出后把「已完成」落盘，使其在崩溃回放中被排除；未结算轮次回放时重新处理（至少一次语义）。
+_Avoid_: commit, confirm
+
+**Journal（准入日志）**：
+append-only 的准入/结算记录文件，崩溃恢复回放的权威来源。
+_Avoid_: WAL, log file
