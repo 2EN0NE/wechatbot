@@ -21,6 +21,8 @@ export interface WechatTurn {
   queuedAttachments: string[];
   /** 插件命令穿透：以 expandPromptTemplates 发送（skill/prompt 展开成 turn）。 */
   expandPromptTemplates?: boolean;
+  /** journal 准入的 turnId（仅文本 turn 有，用于崩溃回放结算，adr/0011）。 */
+  turnId?: string;
 }
 
 export const WECHAT_PREFIX = "[wechat]";

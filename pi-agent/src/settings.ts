@@ -14,6 +14,8 @@ export type ProjectSwitch = "inherit" | Switch;
 export interface UserConfig {
   timeoutSeconds: number;
   commands: Record<string, Switch>;
+  /** 发送者白名单（ADR-0010）：未设 = 首用户配对；设了 = 显式锁定。 */
+  allowedUserId?: string;
 }
 
 export interface ProjectConfig {
@@ -63,6 +65,10 @@ export function normalizeUserConfig(raw: unknown): UserConfig {
     for (const [k, v] of Object.entries(commands as Record<string, unknown>)) {
       if (v === "on" || v === "off") base.commands[k] = v;
     }
+  }
+  const allowedUserId = r.allowedUserId;
+  if (typeof allowedUserId === "string" && allowedUserId.trim() !== "") {
+    base.allowedUserId = allowedUserId.trim();
   }
   return base;
 }

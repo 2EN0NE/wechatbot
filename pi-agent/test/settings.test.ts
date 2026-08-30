@@ -1,3 +1,4 @@
+// 微信桥配置模型测试。
 import { describe, it, expect } from "vitest";
 import {
   defaultUserConfig,
@@ -108,6 +109,25 @@ describe("normalizeUserConfig", () => {
     expect(normalizeUserConfig({ timeoutSeconds: -5 }).timeoutSeconds).toBe(
       DEFAULT_TIMEOUT_SECONDS,
     );
+  });
+
+  it("保留非空 allowedUserId，丢弃空串与非字符串", () => {
+    expect(normalizeUserConfig({ allowedUserId: "wxid_1" }).allowedUserId).toBe(
+      "wxid_1",
+    );
+    // 保留时 trim 首尾空白，避免带空白的值永不匹配、锁死白名单（无配对回退）。
+    expect(
+      normalizeUserConfig({ allowedUserId: "  wxid_1  " }).allowedUserId,
+    ).toBe("wxid_1");
+    expect(
+      normalizeUserConfig({ allowedUserId: "" }).allowedUserId,
+    ).toBeUndefined();
+    expect(
+      normalizeUserConfig({ allowedUserId: "  " }).allowedUserId,
+    ).toBeUndefined();
+    expect(
+      normalizeUserConfig({ allowedUserId: 42 }).allowedUserId,
+    ).toBeUndefined();
   });
 });
 
