@@ -76,10 +76,14 @@ export function replayUnsettledFromLines(lines: string[]): AdmittedEntry[] {
 }
 
 export interface Journal {
-  /** 入队前持久化一条 admitted 记录（尽力而为，失败不抛出）。 */
-  admit(entry: Omit<AdmittedEntry, "kind">): Promise<void>;
-  /** turn 生命周期终结时持久化一条 settled 记录（尽力而为）。 */
-  settle(turnId: string): Promise<void>;
+  /**
+   * 入队前持久化一条 admitted 记录。失败不抛出，返回是否落盘成功——
+   * 调用方据此决定是否记 `journal admitted` 事件（未落盘却打成功日志会让
+   * 崩溃回放的入口证据变成假证据，见 adr/0013）。
+   */
+  admit(entry: Omit<AdmittedEntry, "kind">): Promise<boolean>;
+  /** turn 生命周期终结时持久化一条 settled 记录；失败不抛出，返回是否落盘成功。 */
+  settle(turnId: string): Promise<boolean>;
   /** 回放尚未结算的 admitted 记录。 */
   replayUnsettled(): Promise<AdmittedEntry[]>;
   /** 重写文件，只保留未结算的 admitted 记录，防无限增长。 */
@@ -130,7 +134,7 @@ export function createJournal(
 
   return {
     async admit(entry) {
-      await run(async () => {
+      return run(async () => {
         try {
           await ensureDir();
           await appendFile(
@@ -138,13 +142,15 @@ export function createJournal(
             `${JSON.stringify({ ...entry, kind: "admitted" })}\n`,
             "utf-8",
           );
+          return true;
         } catch (e) {
           onError?.(e);
+          return false;
         }
       });
     },
     async settle(turnId) {
-      await run(async () => {
+      return run(async () => {
         try {
           await ensureDir();
           await appendFile(
@@ -152,8 +158,10 @@ export function createJournal(
             `${JSON.stringify({ kind: "settled", turnId })}\n`,
             "utf-8",
           );
+          return true;
         } catch (e) {
           onError?.(e);
+          return false;
         }
       });
     },

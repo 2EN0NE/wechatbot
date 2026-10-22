@@ -92,7 +92,7 @@ describe("createJournal（真实 IO）", () => {
   it("admit → settle → replay 空，compact 清空", async () => {
     const { dir, path, journal } = await makeJournal();
     try {
-      await journal.admit({
+      const admitted = await journal.admit({
         turnId: "t1",
         userId: "u1",
         text: "hi",
@@ -100,7 +100,8 @@ describe("createJournal（真实 IO）", () => {
         contextToken: "ct",
         timestamp: "",
       });
-      await journal.settle("t1");
+      expect(admitted).toBe(true);
+      expect(await journal.settle("t1")).toBe(true);
       expect(await journal.replayUnsettled()).toEqual([]);
       await journal.compact();
       expect(await readFile(path, "utf-8")).toBe("");
@@ -186,6 +187,33 @@ describe("createJournal（真实 IO）", () => {
       await journal.discard();
       expect(await journal.replayUnsettled()).toEqual([]);
       expect(await readFile(path, "utf-8")).toBe("");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("写盘失败时 admit / settle 返回 false 并上报 onError（不谎报成功）", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "wechat-journal-"));
+    try {
+      // 父路径是个普通文件 → ensureDir 必然 ENOTDIR，写盘失败且不抛出。
+      const blocker = join(dir, "blocker");
+      await writeFile(blocker, "", "utf-8");
+      const errors: unknown[] = [];
+      const journal = createJournal(join(blocker, "journal.jsonl"), (e) =>
+        errors.push(e),
+      );
+      expect(
+        await journal.admit({
+          turnId: "t1",
+          userId: "u1",
+          text: "hi",
+          type: "text",
+          contextToken: "ct",
+          timestamp: "",
+        }),
+      ).toBe(false);
+      expect(await journal.settle("t1")).toBe(false);
+      expect(errors).toHaveLength(2);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

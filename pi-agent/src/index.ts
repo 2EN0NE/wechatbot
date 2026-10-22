@@ -59,6 +59,11 @@ import { buildPiContent } from "./inbound.js";
 import { authorizationState } from "./authorize.js";
 import { createJournal } from "./journal.js";
 import {
+  createBridgeMetrics,
+  createQueueDepthMonitor,
+  formatBridgeCounters,
+} from "./metrics.js";
+import {
   classifyCommand,
   nativeCommandById,
   NATIVE_COMMANDS,
@@ -167,6 +172,43 @@ export default function wechatBridge(pi: ExtensionAPI) {
     (e) => log.error("journal error", { error: String(e) }),
   );
 
+  // 桥侧进程内计数（adr/0013）：/status 展示用，随扩展实例重建归零。
+  const metrics = createBridgeMetrics();
+
+  /**
+   * 结算一个 turn：journal 落盘 + 计数 + 结构化日志（adr/0011 / 0013）。
+   *
+   * 只有真的写进 journal 才记 `journal settled` 与计数——落盘失败已由
+   * journal 的 onError 记成 `journal error`，再补一条成功事件会让「这轮
+   * 到底结算没有」自相矛盾（adr/0013 把这条日志当作回放验证的证据）。
+   */
+  async function settleTurn(turn: WechatTurn): Promise<void> {
+    if (!turn.turnId) return;
+    if (!(await journal.settle(turn.turnId))) return;
+    metrics.settled();
+    log.info("journal settled", {
+      turnId: turn.turnId,
+      depth: pendingTurns.length,
+    });
+  }
+
+  // 队列深度只记跨越阈值事件，不做定时采样（adr/0013）。
+  const queueDepth = createQueueDepthMonitor();
+
+  /** 观测一次当前排队深度，跨越阈值时落日志。 */
+  function noteQueueDepth(): void {
+    for (const event of queueDepth.update(pendingTurns.length)) {
+      if (event.kind === "rising") {
+        log.warn("queued turns rising", {
+          depth: event.depth,
+          threshold: event.threshold,
+        });
+      } else {
+        log.info("queued turns drained", { depth: event.depth });
+      }
+    }
+  }
+
   // ── Config helpers ───────────────────────────────────────────────────
 
   function enabledFor(id: string, exempt: boolean): boolean {
@@ -259,6 +301,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
       userId: turn.reply.userId,
       seconds: secs,
     });
+    metrics.stalled();
   };
 
   // ── Status rendering ─────────────────────────────────────────────────
@@ -407,6 +450,8 @@ export default function wechatBridge(pi: ExtensionAPI) {
       lines.push("Context: unknown");
     }
     if (lines.length === 0) lines.push("No usage data yet.");
+    const bridge = formatBridgeCounters(metrics.snapshot());
+    if (bridge) lines.push(bridge);
     return lines.join("\n");
   }
 
@@ -460,6 +505,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
   async function pumpTurn(): Promise<void> {
     const turn = pendingTurns.shift();
     if (!turn) return;
+    noteQueueDepth();
     activeTurn = turn;
 
     for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
@@ -489,7 +535,8 @@ export default function wechatBridge(pi: ExtensionAPI) {
         // 通知微信用户并置错误状态。写 settled 标记生命周期终结（adr/0011）。
         activeTurn = null;
         bridgeError = error;
-        if (turn.turnId) await journal.settle(turn.turnId);
+        await settleTurn(turn);
+        metrics.dropped();
         log.error("failed to send turn to pi after retries", {
           userId: turn.reply.userId,
           attempts: MAX_SEND_ATTEMPTS,
@@ -522,6 +569,8 @@ export default function wechatBridge(pi: ExtensionAPI) {
       const turn = await buildWechatTurn(msg);
       turn.turnId = entry.turnId;
       pendingTurns.push(turn);
+      noteQueueDepth();
+      metrics.replayed();
       log.info("replayed turn from journal", {
         turnId: entry.turnId,
         userId: entry.userId,
@@ -671,6 +720,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
       expandPromptTemplates: true,
     };
     pendingTurns.push(turn);
+    noteQueueDepth();
     try {
       await bot!.sendTyping(msg.userId);
     } catch {
@@ -763,17 +813,18 @@ export default function wechatBridge(pi: ExtensionAPI) {
       ? pendingTurns.splice(0)
       : [];
     preserveQueuedTurnsAsHistory = false;
+    noteQueueDepth();
 
     // 被折叠的积压 turn 生命周期终结：写 settled，避免崩溃回放重复处理（adr/0011）。
     for (const folded of historyTurns) {
-      if (folded.turnId) await journal.settle(folded.turnId);
+      await settleTurn(folded);
     }
 
     // 文本消息先持久准入（admitted）再入队；journal 写失败不阻断（尽力而为）。
     const turn = await buildWechatTurn(msg, historyTurns);
     if (msg.type === "text") {
       turn.turnId = randomUUID();
-      await journal.admit({
+      const persisted = await journal.admit({
         turnId: turn.turnId,
         userId: msg.userId,
         text: msg.text,
@@ -781,8 +832,18 @@ export default function wechatBridge(pi: ExtensionAPI) {
         contextToken: msg._contextToken,
         timestamp: msg.timestamp.toISOString(),
       });
+      // 未落盘就不打成功事件、不计数：失败由 onError 的 `journal error` 上报。
+      if (persisted) {
+        metrics.admitted();
+        log.info("journal admitted", {
+          turnId: turn.turnId,
+          userId: msg.userId,
+          depth: pendingTurns.length,
+        });
+      }
     }
     pendingTurns.push(turn);
+    noteQueueDepth();
 
     try {
       await bot.sendTyping(msg.userId);
@@ -915,7 +976,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
     // 内容但发送失败」——此时保留 unsettled，崩溃回放会重新处理，保证至少一次送达
     //（adr/0011）。
     if (turn.turnId && (!hasReplyDeliverable || replyDelivered)) {
-      await journal.settle(turn.turnId);
+      await settleTurn(turn);
     }
 
     // Advance the queue — unless a "stop" folded the backlog into the next
@@ -1156,6 +1217,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
     connected = false;
     connecting = false;
     pendingTurns.length = 0;
+    noteQueueDepth();
     activeTurn = null;
     preserveQueuedTurnsAsHistory = false;
     lastEndSummary = null;

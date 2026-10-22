@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFile, stat, writeFile, appendFile } from "node:fs/promises";
 
 // ── 模块 mock ──────────────────────────────────────────────────────────
-const h = vi.hoisted(() => ({ bots: [] as any[] }));
+const h = vi.hoisted(() => ({
+  bots: [] as any[],
+  logCalls: [] as Array<{ level: string; event: string; data?: any }>,
+}));
 
 vi.mock("qrcode-terminal", () => ({ default: { generate: vi.fn() } }));
 
@@ -43,12 +46,17 @@ vi.mock("@wechatbot/wechatbot", () => {
   return {
     WeChatBot: FakeWeChatBot,
     createLogger: () => ({
-      child: () => ({
-        info: vi.fn(),
-        debug: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-      }),
+      child: () => {
+        const record =
+          (level: string) => (event: string, data?: any) =>
+            h.logCalls.push({ level, event, data });
+        return {
+          info: vi.fn(record("info")),
+          debug: vi.fn(record("debug")),
+          warn: vi.fn(record("warn")),
+          error: vi.fn(record("error")),
+        };
+      },
     }),
     stripMarkdown: (s: string) => s,
   };
@@ -150,6 +158,7 @@ const ENOENT = () => {
 
 beforeEach(() => {
   h.bots.length = 0;
+  h.logCalls.length = 0;
   vi.mocked(readFile).mockImplementation(async () => ENOENT());
 });
 
@@ -805,5 +814,291 @@ describe("扩展命令穿透错误处理（审查 P3）", () => {
       msg,
       expect.stringContaining("已触发扩展命令"),
     );
+  });
+});
+
+describe("桥指标与 journal 可见性（ADR-0013）", () => {
+  it("文本 turn 准入后记 journal admitted 事件（含 turnId / userId / depth）", async () => {
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello counters"));
+
+    const admitted = h.logCalls.find((c) => c.event === "journal admitted");
+    expect(admitted).toBeTruthy();
+    expect(typeof admitted!.data.turnId).toBe("string");
+    expect(admitted!.data.userId).toBe("user1");
+    expect(admitted!.data.depth).toBe(0);
+  });
+
+  it("轮次终结后记 journal settled 事件（含 turnId）", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello settle"));
+    await fire(
+      handlers,
+      "agent_end",
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        ],
+      },
+      ctx,
+    );
+    await fire(handlers, "agent_settled", {}, ctx);
+
+    const settled = h.logCalls.find((c) => c.event === "journal settled");
+    expect(settled).toBeTruthy();
+    expect(typeof settled!.data.turnId).toBe("string");
+  });
+
+  it("/status 追加桥侧计数行，只列非零项", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    vi.mocked(readFile).mockImplementation(async (path: any) => {
+      if (String(path).endsWith("wechatbot.json")) {
+        return JSON.stringify({ commands: { status: "on" } });
+      }
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx);
+    const onMsg = bot().onMessageCb;
+
+    // 先跑完一轮，让 admitted / settled 计数非零
+    await onMsg(makeMsg("hello status"));
+    await fire(
+      handlers,
+      "agent_end",
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        ],
+      },
+      ctx,
+    );
+    await fire(handlers, "agent_settled", {}, ctx);
+
+    const statusMsg = makeMsg("/status");
+    await onMsg(statusMsg);
+
+    const statusReply = vi
+      .mocked(bot().reply)
+      .mock.calls.find((c: any[]) => c[0] === statusMsg);
+    expect(statusReply).toBeTruthy();
+    expect(String(statusReply![1])).toContain("Bridge: admitted 1 · settled 1");
+  });
+
+  it("回放进来的 turn 计入 replayed", async () => {
+    vi.mocked(readFile).mockImplementation(async (path: any) => {
+      const p = String(path);
+      if (p.endsWith("wechat-journal.jsonl")) {
+        return `${JSON.stringify({
+          kind: "admitted",
+          turnId: "t-replay",
+          userId: "user1",
+          text: "replayed hello",
+          type: "text",
+          contextToken: "ct",
+          timestamp: "",
+        })}\n`;
+      }
+      if (p.endsWith("wechatbot.json")) {
+        return JSON.stringify({ commands: { status: "on" } });
+      }
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx); // 连接即回放
+    await fire(handlers, "session_start", {}, ctx); // 加载 commands.status=on
+
+    const statusMsg = makeMsg("/status");
+    await bot().onMessageCb(statusMsg);
+    const statusReply = vi
+      .mocked(bot().reply)
+      .mock.calls.filter((c: any[]) => c[0] === statusMsg)
+      .at(-1); // 首个入站消息会先收到欢迎语，/status 的回执在最后
+    expect(String(statusReply![1])).toContain("replayed 1");
+  });
+});
+
+describe("桥指标：dropped / stalled 接线（ADR-0013）", () => {
+  /** 启用 /status，并让配置读取与 journal 读取互不干扰。 */
+  function mockStatusEnabled(): void {
+    vi.mocked(readFile).mockImplementation(async (path: any) => {
+      if (String(path).endsWith("wechatbot.json")) {
+        return JSON.stringify({ commands: { status: "on" } });
+      }
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+  }
+
+  async function askStatus(onMsg: any): Promise<string> {
+    const statusMsg = makeMsg("/status");
+    await onMsg(statusMsg);
+    const reply = vi
+      .mocked(bot().reply)
+      .mock.calls.find((c: any[]) => c[0] === statusMsg);
+    return String(reply![1]);
+  }
+
+  it("不活跃超时触发后 /status 计入 stalled", async () => {
+    vi.useFakeTimers();
+    mockStatusEnabled();
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello stall"));
+    await fire(handlers, "agent_start", {}, ctx);
+    await vi.advanceTimersByTimeAsync(180_000);
+
+    expect(await askStatus(onMsg)).toContain("stalled 1");
+  });
+
+  it("sendUserMessage 重试耗尽后 /status 计入 dropped", async () => {
+    vi.useFakeTimers();
+    mockStatusEnabled();
+    const { pi, handlers, commands } = makeFakePi();
+    pi.sendUserMessage.mockRejectedValue(new Error("boom"));
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx);
+    const onMsg = bot().onMessageCb;
+
+    const sending = onMsg(makeMsg("hello drop"));
+    await vi.advanceTimersByTimeAsync(8_000); // 1s + 2s + 4s 退避
+    await sending;
+
+    expect(await askStatus(onMsg)).toContain("dropped 1");
+  });
+
+  it("积压越过阈值记 queued turns rising，队列清空后记 queued turns drained", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    // m1 立刻成为 active turn，m2–m5 排队 → 深度 4，越过阈值 3
+    for (const text of ["m1", "m2", "m3", "m4", "m5"]) {
+      await onMsg(makeMsg(text));
+    }
+
+    const rising = h.logCalls.find((c) => c.event === "queued turns rising");
+    expect(rising).toBeTruthy();
+    expect(rising!.level).toBe("warn");
+    expect(rising!.data.threshold).toBe(3);
+    expect(rising!.data.depth).toBeGreaterThan(3);
+
+    // 逐个推进队列直至清空
+    for (let i = 0; i < 5; i++) await fire(handlers, "agent_settled", {}, ctx);
+
+    expect(
+      h.logCalls.some((c) => c.event === "queued turns drained"),
+    ).toBe(true);
+  });
+
+  it("skill 命令入队也观测深度：越过阈值记 queued turns rising", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    pi.getCommands.mockReturnValue([
+      { name: "review", source: "skill", description: "审阅" },
+    ]);
+    vi.mocked(readFile).mockImplementation(async (path: any) => {
+      if (String(path).startsWith("/fake/agent")) {
+        return JSON.stringify({ commands: { review: "on" } });
+      }
+      return JSON.stringify({});
+    });
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx); // 填充 pluginSources
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello active")); // 占住 active turn
+    for (let i = 0; i < 4; i++) await onMsg(makeMsg("/review")); // 深度 1→4
+
+    const rising = h.logCalls.find((c) => c.event === "queued turns rising");
+    expect(rising).toBeTruthy();
+    expect(rising!.data.depth).toBe(4);
+  });
+
+  it("断开清空积压时记 queued turns drained（不留 rising 无 drained）", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    for (const text of ["m1", "m2", "m3", "m4", "m5"]) {
+      await onMsg(makeMsg(text));
+    }
+    expect(h.logCalls.some((c) => c.event === "queued turns rising")).toBe(true);
+
+    await fire(handlers, "session_shutdown", {}, ctx);
+
+    const drained = h.logCalls.find((c) => c.event === "queued turns drained");
+    expect(drained).toBeTruthy();
+    expect(drained!.data.depth).toBe(0);
+  });
+});
+
+describe("journal 写盘失败时不谎报成功（ADR-0013）", () => {
+  /** 只让 journal 的写入失败，日志 transport 的 appendFile 照常吞掉。 */
+  function failJournalWrites(match: (data: string) => boolean): void {
+    vi.mocked(appendFile).mockImplementation(async (p: any, data: any) => {
+      if (String(p).endsWith("wechat-journal.jsonl") && match(String(data))) {
+        throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+      }
+    });
+  }
+
+  afterEach(() => {
+    vi.mocked(appendFile).mockImplementation(async () => {});
+  });
+
+  it("admit 写入失败：不记 journal admitted，失败由 journal error 上报", async () => {
+    failJournalWrites(() => true);
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+
+    await bot().onMessageCb(makeMsg("hello no journal"));
+
+    expect(h.logCalls.some((c) => c.event === "journal admitted")).toBe(false);
+    expect(h.logCalls.some((c) => c.event === "journal error")).toBe(true);
+    // 准入落盘失败不阻断投递（尽力而为），turn 仍然交给 pi
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("settle 写入失败：不记 journal settled，失败由 journal error 上报", async () => {
+    failJournalWrites((data) => data.includes('"kind":"settled"'));
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const onMsg = bot().onMessageCb;
+
+    await onMsg(makeMsg("hello settle fail"));
+    await fire(
+      handlers,
+      "agent_end",
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        ],
+      },
+      ctx,
+    );
+    await fire(handlers, "agent_settled", {}, ctx);
+
+    expect(h.logCalls.some((c) => c.event === "journal admitted")).toBe(true);
+    expect(h.logCalls.some((c) => c.event === "journal settled")).toBe(false);
+    expect(h.logCalls.some((c) => c.event === "journal error")).toBe(true);
   });
 });

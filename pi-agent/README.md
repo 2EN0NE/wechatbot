@@ -108,9 +108,46 @@ agent 需要把文件（图片 / 视频 / 文档）发回微信时，调用 `wec
 
 桥接日志写到文件 `~/.pi/logs/wechat_<YYYYMMDD>.log`（不刷 TUI），格式 `ISO时间戳 LEVEL [context] 消息 {json}`。
 
-记录内容：消息接收（含 ≤80 字符脱敏预览）、命令识别、桥未连接时丢弃消息（warn）、`sendUserMessage` 失败、回复结果、连接 / 断开 / session 过期 / SDK 错误。
+记录内容：消息接收（含 ≤80 字符脱敏预览）、命令识别、桥未连接时丢弃消息（warn）、`sendUserMessage` 失败、回复结果、连接 / 断开 / session 过期 / SDK 错误，以及 journal 的准入与结算（`journal admitted` / `journal settled`，带 turnId 与排队深度）、队列深度跨越阈值（`queued turns rising` / `queued turns drained`）、回放（`replayed turn from journal`）。
+
+日志是耐久真源；`/status` 里的桥侧计数行只是当场看一眼的便利（进程内计数，重启归零）：
+
+```
+Bridge: admitted 3 · settled 3 · replayed 1 · stalled 1
+```
+
+只列非零项，顺序固定（admitted / settled / replayed / dropped / stalled）；全 0 时不显示这一行。
 
 排障：`tail -f ~/.pi/logs/wechat_*.log` 看桥接行为；pi 会话 JSONL 看 agent 处理。
+
+### 崩溃回放演练（真机 UAT）
+
+微信 iLink 无法做 e2e，回放能力靠两阶段断言留证。两个断言对应两件不同的事：
+
+- **入口证据** — admit 在崩溃前真的落了盘（`journal` 里有「已准入未结算」的记录）
+- **恢复证据** — 回放真的把它变成一个跑完的轮次（日志有回放事件，且它不再未结算）
+
+只过其中一个是失败。演练会**真给微信发一条回复**（回放会真发），这是验证本身不是 bug。
+
+```bash
+cd pi-agent
+
+# 阶段一：入口证据
+#   1) 在微信里发一条带标记的消息，例如 drill-20260101
+#   2) 断言它已落盘（省略 turnId 时取最近一条未结算，并打印下一步命令）
+#      别等 pi 回完：这轮一旦结算，断言就没有可验证对象了（脚本会提示重发）。
+npm run drill -- --check-entry
+
+#   3) 模拟崩溃：kill -9 掉 pi 进程（不要用正常退出，那会走优雅关闭）
+#   4) 重启 pi 会话并 /wechat 重连
+
+# 阶段二：恢复证据
+npm run drill -- --check-replay <turnId>
+```
+
+脚本默认读 `~/.pi/agent/wechat-journal.jsonl`（尊重 `PI_CODING_AGENT_DIR` 覆盖，与扩展侧 `getAgentDir()` 同源）与 `~/.pi/logs/wechat_<YYYYMMDD>.log`，可用 `--journal` / `--log` 覆盖；`--help` 看全部用法。
+
+注意：`compact` 在每次重连时运行，会把已结算记录从 journal 里清掉——所以**正常收尾之后 journal 是空文件，这是对的**，不代表回放没跑过。
 
 ## 工作原理
 
