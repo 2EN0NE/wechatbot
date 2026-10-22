@@ -71,3 +71,7 @@ _Avoid_: commit, confirm
 **Journal（准入日志）**：
 append-only 的准入/结算记录文件，崩溃恢复回放的权威来源。
 _Avoid_: WAL, log file
+
+**Replay（回放）**：
+崩溃恢复后把 Journal 中「已准入未结算」的记录重新当作一个 turn 处理，语义为至少一次。
+_Avoid_: 仿真, resume, 重放消息
