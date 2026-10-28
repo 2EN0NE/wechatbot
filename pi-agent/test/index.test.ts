@@ -75,9 +75,40 @@ function makeFakePi() {
     { description: string; handler: (...a: any[]) => any }
   >();
   const tools: any[] = [];
+  // 命令级 ctx：pi 的扩展命令 handler 拿到的那个（含 newSession）。
+  const commandCtx = makeFakeCtx({
+    newSession: vi.fn(async () => ({ cancelled: false })),
+  });
+  // pi 的 sendUserMessage 是「发后不管」：签名返回 void（types.d.ts），扩展命令 handler
+  // 在后台跑，失败走 runner.emitError 而非 rejection（loader.js:311）。替身必须保持这个
+  // 契约，否则会掩盖依赖「派发完成」信号的交接 bug（adr/0014）。
+  const commandRuns: Promise<void>[] = [];
   const pi: any = {
-    sendUserMessage: vi.fn(async () => {}),
-    getCommands: vi.fn(() => []),
+    sendUserMessage: vi.fn((content: any, opts?: any) => {
+      // 模拟 pi 的 `_tryExecuteExtensionCommand`：expandPromptTemplates + "/name"
+      // 会用**命令级 ctx**（含 newSession）执行扩展命令的 handler。
+      if (!opts?.expandPromptTemplates) return;
+      const text = typeof content === "string" ? content : "";
+      if (!text.startsWith("/")) return;
+      const name = text.slice(1).split(/\s+/)[0];
+      const cmd = commands.get(name);
+      if (!cmd) return;
+      commandRuns.push(
+        (async () => {
+          await cmd.handler("", commandCtx);
+        })(),
+      );
+    }),
+    // pi 的 getCommands() 返回 invocationName（单实例时就是注册名）：桥在派发内部命令前
+    // 据此确认命令可用（漏查会把 /wechat-internal-new 当普通 prompt 送给模型）。
+    getCommands: vi.fn(() =>
+      [...commands.keys()].map((name) => ({
+        name,
+        description: "",
+        source: "extension",
+        sourceInfo: { path: "/x/src/index.ts" },
+      })),
+    ),
     on: vi.fn((event: string, handler: Handler) => {
       const list = handlers.get(event) ?? [];
       list.push(handler);
@@ -88,7 +119,11 @@ function makeFakePi() {
     ),
     registerTool: vi.fn((tool: any) => tools.push(tool)),
   };
-  return { pi, handlers, commands, tools };
+  /** 等后台命令 handler 跑完（sendUserMessage 是发后不管，测试需显式等待）。 */
+  const flushCommands = async (): Promise<void> => {
+    while (commandRuns.length > 0) await Promise.all(commandRuns.splice(0));
+  };
+  return { pi, handlers, commands, tools, commandCtx, flushCommands };
 }
 
 function makeFakeCtx(overrides: any = {}): any {
@@ -108,7 +143,7 @@ function makeFakeCtx(overrides: any = {}): any {
     isIdle: vi.fn(() => true),
     abort: vi.fn(),
     compact: vi.fn(),
-    newSession: vi.fn(async () => {}),
+    // 事件 ctx 没有会话控制方法（pi 1.4）：newSession 只在命令 ctx 上（见 makeFakePi.commandCtx）。
     sessionManager: { getEntries: vi.fn(() => []) },
     getContextUsage: vi.fn(() => undefined),
     model: undefined,
@@ -164,6 +199,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  // 远端豁免接口挂在 globalThis 上，跨用例必须清理（ADR-0014）。
+  delete (globalThis as { __confirmGateApi?: unknown }).__confirmGateApi;
 });
 
 // ── 用例 ───────────────────────────────────────────────────────────────
@@ -228,7 +265,7 @@ describe("发送者白名单鉴权（ADR-0010）", () => {
   });
 
   it("未授权发送者的命令（含豁免命令）同样被静默丢弃", async () => {
-    const { pi, handlers, commands } = makeFakePi();
+    const { pi, handlers, commands, commandCtx } = makeFakePi();
     vi.mocked(readFile).mockImplementation(async () =>
       JSON.stringify({ allowedUserId: "owner" }),
     );
@@ -247,7 +284,7 @@ describe("发送者白名单鉴权（ADR-0010）", () => {
 
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
     expect(bot().reply).not.toHaveBeenCalled();
-    expect(ctx.newSession).not.toHaveBeenCalled(); // /new 未触发会话重建
+    expect(commandCtx.newSession).not.toHaveBeenCalled(); // /new 未触发会话重建
   });
 
   it("配对后第二个不同发送者立即被拒绝（无需等待落盘）", async () => {
@@ -1100,5 +1137,347 @@ describe("journal 写盘失败时不谎报成功（ADR-0013）", () => {
     expect(h.logCalls.some((c) => c.event === "journal admitted")).toBe(true);
     expect(h.logCalls.some((c) => c.event === "journal settled")).toBe(false);
     expect(h.logCalls.some((c) => c.event === "journal error")).toBe(true);
+  });
+});
+
+// ── 远端豁免接线（ADR-0014）──────────────────────────────────────────────
+
+interface FakeConfirmGate {
+  hasLicense: ReturnType<typeof vi.fn>;
+  isArmed: ReturnType<typeof vi.fn>;
+  arm: ReturnType<typeof vi.fn>;
+  disarm: ReturnType<typeof vi.fn>;
+}
+
+function installFakeConfirmGate(
+  overrides: { licensed?: boolean; armed?: boolean } = {},
+): FakeConfirmGate {
+  const disarm = vi.fn();
+  const gate: FakeConfirmGate = {
+    hasLicense: vi.fn(() => overrides.licensed ?? true),
+    isArmed: vi.fn(() => overrides.armed ?? true),
+    arm: vi.fn(() => (overrides.licensed === false ? undefined : disarm)),
+    disarm,
+  };
+  (globalThis as { __confirmGateApi?: unknown }).__confirmGateApi = {
+    hasLicense: gate.hasLicense,
+    isArmed: gate.isArmed,
+    owners: () => ["wechat"],
+    arm: gate.arm,
+    status: () => ({
+      license: overrides.licensed ?? true,
+      armed: overrides.armed ?? true,
+      owners: ["wechat"],
+      mode: overrides.armed === false ? "licensed-idle" : "armed",
+    }),
+  };
+  return gate;
+}
+
+function replyTexts(): string[] {
+  return vi.mocked(bot().reply).mock.calls.map((c: any[]) => String(c[1]));
+}
+
+describe("远端豁免接线（ADR-0014）", () => {
+  it("连接就绪即 arm('wechat')，会话关闭即 disarm（幂等）", async () => {
+    const gate = installFakeConfirmGate();
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+
+    expect(gate.arm).toHaveBeenCalledWith("wechat");
+    expect(gate.disarm).not.toHaveBeenCalled();
+
+    await fire(handlers, "session_shutdown", {}, ctx);
+    expect(gate.disarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("无豁免接口时连接照常成功（fail-soft，不 arm 也不抛错）", async () => {
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await expect(connect(pi, commands, ctx)).resolves.toBeUndefined();
+    expect(bot()).toBeTruthy();
+  });
+
+  it("登录中重复 /wechat 不会泄漏豁免占用：arm 次数与 disarm 次数配平", async () => {
+    const gate = installFakeConfirmGate();
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    wechatBridge(pi);
+    const startWechat = commands.get("wechat")!;
+
+    // 两个 startWechat 并发在飞行中（connected 仍为 false，两次都会走到 arm）。
+    await Promise.all([
+      startWechat.handler(undefined, ctx),
+      startWechat.handler(undefined, ctx),
+    ]);
+    expect(gate.arm).toHaveBeenCalledTimes(2);
+    // 第二次占用前先释放第一次的解除函数，否则 selector 引用计数泄漏、永久 armed。
+    expect(gate.disarm).toHaveBeenCalledTimes(1);
+
+    await fire(handlers, "session_shutdown", {}, ctx);
+    expect(gate.disarm).toHaveBeenCalledTimes(2);
+  });
+
+  it("解除函数抛错（selector 侧 stale ctx）不打断关闭流程：先摘引用再调用，不重放坏引用", async () => {
+    const gate = installFakeConfirmGate();
+    gate.disarm.mockImplementation(() => {
+      throw new Error("This extension ctx is stale after session replacement or reload.");
+    });
+    const { pi, handlers, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const activeBot = bot();
+
+    await expect(fire(handlers, "session_shutdown", {}, ctx)).resolves.toBeUndefined();
+
+    expect(activeBot.stop).toHaveBeenCalledTimes(1);
+    expect(gate.disarm).toHaveBeenCalledTimes(1);
+    expect(h.logCalls.some((c) => c.event === "confirm gate disarm failed")).toBe(true);
+
+    // 引用已摘除：再次关闭不会重放同一个坏解除函数（否则 selector 侧引用计数永不递减）。
+    await fire(handlers, "session_shutdown", {}, ctx);
+    expect(gate.disarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("接口探测抛错：拒绝回执指出接口异常，而不是误导为「没带启动参数」", async () => {
+    installFakeConfirmGate();
+    (globalThis as { __confirmGateApi?: any }).__confirmGateApi.isArmed = () => {
+      throw new Error("This extension ctx is stale after session replacement or reload.");
+    };
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+
+    await bot().onMessageCb(makeMsg("/new"));
+
+    const refusal = replyTexts().find((t) =>
+      t.includes("a TUI confirmation prompt would block it"),
+    );
+    expect(refusal).toContain("the confirm-gate API raised");
+    expect(refusal).toContain("This extension ctx is stale");
+    expect(refusal).not.toContain("Start pi with --unattended-confirm");
+  });
+
+  it("未 armed：/new 直接回执拒绝，不触达 ctx.newSession（不挂起）", async () => {
+    const gate = installFakeConfirmGate({ licensed: false, armed: false });
+    const { pi, commands, commandCtx } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    expect(gate.arm).toHaveBeenCalledWith("wechat"); // 被拒 → 不占用
+
+    await bot().onMessageCb(makeMsg("/new"));
+
+    expect(commandCtx.newSession).not.toHaveBeenCalled();
+    expect(
+      replyTexts().some((t) => t.includes("a TUI confirmation prompt would block it")),
+    ).toBe(true);
+  });
+
+  it("armed + 被扩展取消：回执 cancel，且不残留重连标志（session_start 不重建 bot）", async () => {
+    installFakeConfirmGate();
+    const { pi, handlers, commands, commandCtx, flushCommands } = makeFakePi();
+    commandCtx.newSession.mockResolvedValue({ cancelled: true });
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+
+    await bot().onMessageCb(makeMsg("/new"));
+    await flushCommands(); // 派发是发后不管，命令 handler 在后台跑
+    expect(commandCtx.newSession).toHaveBeenCalledTimes(1);
+    expect(replyTexts().some((t) => t.includes("New session cancelled"))).toBe(true);
+
+    // 若 restartAfterReplace 残留，session_start 会重连并新建 bot —— 必须没有。
+    const botsBefore = h.bots.length;
+    await fire(handlers, "session_start", {}, ctx);
+    expect(h.bots.length).toBe(botsBefore);
+  });
+
+  it("armed + 会话替换成功：session_start 自动重连并补发 ack", async () => {
+    installFakeConfirmGate();
+    const { pi, handlers, commands, commandCtx, flushCommands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    const botsBefore = h.bots.length;
+
+    await bot().onMessageCb(makeMsg("/new"));
+    await flushCommands(); // 派发是发后不管，命令 handler 在后台跑
+    // 真实顺序：session_before_switch → session_shutdown（旧实例停 bot）→ session_start（重连）
+    await fire(handlers, "session_shutdown", {}, ctx);
+    await fire(handlers, "session_start", {}, ctx);
+
+    expect(h.bots.length).toBe(botsBefore + 1);
+    expect(
+      replyTexts().some((t) => t.includes("New session started")),
+    ).toBe(true);
+  });
+});
+
+// ── 会话替换后不得再用旧 ctx（pi 1.4 契约）───────────────────────────────
+
+describe("会话替换后的 stale ctx（ADR-0014 回归）", () => {
+  it("arm() 抛 stale 错（selector 旧 ctx）时连接照常成功，且不误报 Login failed", async () => {
+    const gate = installFakeConfirmGate();
+    gate.arm.mockImplementation(() => {
+      throw new Error("This extension ctx is stale after session replacement or reload.");
+    });
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+
+    await expect(connect(pi, commands, ctx)).resolves.toBeUndefined();
+    expect(bot()).toBeTruthy();
+    expect(
+      vi.mocked(ctx.ui.notify).mock.calls.some((c: any[]) =>
+        String(c[0]).includes("Login failed"),
+      ),
+    ).toBe(false);
+  });
+
+  it("/new 由内部命令的 fresh 命令 ctx 执行：事件 ctx 无 newSession 且替换后失效也不影响", async () => {
+    installFakeConfirmGate();
+    let stale = false;
+    const ctx = makeFakeCtx();
+    const ui = ctx.ui;
+    Object.defineProperty(ctx, "ui", {
+      configurable: true,
+      get() {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        return ui;
+      },
+    });
+
+    const { pi, handlers, commands, commandCtx, flushCommands } = makeFakePi();
+    // 核心回归：事件 ctx 根本没有 newSession（pi 1.4 只在命令 ctx 上提供）。
+    expect(ctx.newSession).toBeUndefined();
+    // 最坏时序：派发那一刻起旧 ctx 即视为失效（pi 可能在派发后任意时刻完成替换）。
+    // 因此派发后任何 ctx 访问都会被本用例的 ui getter 抓到并 reject。
+    const send = vi.mocked(pi.sendUserMessage);
+    const dispatchInBackground = send.getMockImplementation()!;
+    send.mockImplementation((content: any, opts?: any) => {
+      dispatchInBackground(content, opts);
+      stale = true;
+    });
+    await connect(pi, commands, ctx);
+    const botsBefore = h.bots.length;
+
+    // 派发 /new 后不得再访问 ctx：若 dispatchMessage 仍 updateStatus(ctx)，这里就会 reject。
+    await bot().onMessageCb(makeMsg("/new"));
+    await flushCommands(); // 派发是发后不管，命令 handler 在后台跑
+    expect(commandCtx.newSession).toHaveBeenCalledTimes(1);
+
+    // 真实顺序：session_shutdown（旧实例停 bot）→ session_start（新 ctx 重连并补发 ack）
+    await fire(handlers, "session_shutdown", {}, ctx);
+    await fire(handlers, "session_start", {}, makeFakeCtx());
+    expect(h.bots.length).toBe(botsBefore + 1);
+    expect(replyTexts().some((t) => t.includes("New session started"))).toBe(true);
+  });
+});
+
+// ── 内部 /new 命令（adr/0014）───────────────────────────────────────────
+
+describe("内部 /new 命令（adr/0014）", () => {
+  it("无待处理微信请求时直接调用：只 notify，不替换会话（防 TUI 误触）", async () => {
+    installFakeConfirmGate();
+    const { pi, commands, commandCtx } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+
+    const cmd = commands.get("wechat-internal-new");
+    expect(cmd).toBeTruthy();
+    await cmd!.handler("", commandCtx);
+
+    expect(commandCtx.newSession).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(commandCtx.ui.notify)
+        .mock.calls.some((c: any[]) => String(c[0]).includes("仅由微信桥调用")),
+    ).toBe(true);
+  });
+
+  it("派发未被执行的残留请求过期后丢弃：不替换会话、只回执提示日志", async () => {
+    installFakeConfirmGate();
+    const { pi, commands, commandCtx } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+
+    // 模拟「sendUserMessage 吞掉了派发」：命令 handler 从未执行，pendingNewRequest 残留。
+    vi.mocked(pi.sendUserMessage).mockImplementation(() => {});
+    vi.useFakeTimers();
+    const sent = bot().onMessageCb(makeMsg("/new"));
+    await vi.advanceTimersByTimeAsync(0);
+    await sent;
+
+    // 派发点已回执「已受理」：即使 handler 永不执行，用户也不会「发了 /new 没反应」。
+    expect(replyTexts().some((t) => t.includes("Starting a new session"))).toBe(true);
+    expect(commandCtx.newSession).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    await commands.get("wechat-internal-new")!.handler("", commandCtx);
+
+    expect(commandCtx.newSession).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(commandCtx.ui.notify)
+        .mock.calls.some((c: any[]) => String(c[0]).includes("仅由微信桥调用")),
+    ).toBe(true);
+    expect(
+      h.logCalls.some((c) => c.event === "internal /new invoked without a live WeChat request"),
+    ).toBe(true);
+  });
+
+  it("内部命令未被以本名注册（被重名消歧）→ 拒绝且不派发，不把内部命令当 prompt 送给模型", async () => {
+    installFakeConfirmGate();
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    // 模拟 pi 的重名消歧：注册名变成 wechat-internal-new:1，本名不再存在。
+    pi.getCommands.mockReturnValue([
+      {
+        name: "wechat-internal-new:1",
+        source: "extension",
+        description: "",
+        sourceInfo: { path: "/x/src/index.ts" },
+      },
+    ]);
+    await connect(pi, commands, ctx);
+
+    await bot().onMessageCb(makeMsg("/new"));
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(replyTexts().some((t) => t.includes("is not registered"))).toBe(true);
+    expect(
+      h.logCalls.some((c) => c.event === "internal command unavailable — refusing /new"),
+    ).toBe(true);
+  });
+
+  it("连续两条 /new：拒绝后一条，不覆盖在飞请求", async () => {
+    installFakeConfirmGate();
+    const { pi, commands } = makeFakePi();
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    // 第一条派发后 handler 尚未执行（真实契约：发后不管）。
+    vi.mocked(pi.sendUserMessage).mockImplementation(() => {});
+
+    await bot().onMessageCb(makeMsg("/new"));
+    await bot().onMessageCb(makeMsg("/new"));
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(replyTexts().some((t) => t.includes("already in progress"))).toBe(true);
+  });
+
+  it("不出现在 /help 的命令清单里", async () => {
+    const { pi, handlers, commands } = makeFakePi();
+    pi.getCommands.mockReturnValue([
+      {
+        name: "wechat-internal-new",
+        source: "extension",
+        description: "（内部）微信桥专用 /new 通道",
+        sourceInfo: { path: "/x/src/index.ts" },
+      },
+    ]);
+    const ctx = makeFakeCtx();
+    await connect(pi, commands, ctx);
+    await fire(handlers, "session_start", {}, ctx);
+
+    await bot().onMessageCb(makeMsg("/help"));
+    expect(replyTexts().join("\n")).not.toContain("wechat-internal-new");
   });
 });

@@ -59,6 +59,11 @@ import { buildPiContent } from "./inbound.js";
 import { authorizationState } from "./authorize.js";
 import { createJournal } from "./journal.js";
 import {
+  armConfirmGate,
+  confirmGateLastError,
+  confirmGateMode,
+} from "./confirm-gate.js";
+import {
   createBridgeMetrics,
   createQueueDepthMonitor,
   formatBridgeCounters,
@@ -138,6 +143,15 @@ function sleep(ms: number): Promise<void> {
 let restartAfterReplace = false;
 let pendingAck: { reply: IncomingMessage; text: string } | null = null;
 
+// 远端豁免（adr/0014）：微信连接期间 arm，断开即 disarm。解除函数同样跨实例保留——
+// 旧实例 session_shutdown 停 bot 时要用它释放占用。
+let disarmConfirmGate: (() => void) | undefined;
+
+// 会话控制方法（newSession 等）只存在于**命令** ctx（pi 1.4）。事件 handler 拿不到命令 ctx，
+// 唯一官方通道是把这个内部命令经 sendUserMessage 派发：pi 会用 runner.createCommandContext()
+// 调它的 handler（agent-session.js `_tryExecuteExtensionCommand`），拿到新鲜命令 ctx。
+const INTERNAL_NEW_COMMAND = "wechat-internal-new";
+
 export default function wechatBridge(pi: ExtensionAPI) {
   let bot: WeChatBot | null = null;
   let connected = false;
@@ -149,6 +163,12 @@ export default function wechatBridge(pi: ExtensionAPI) {
   let currentAbort: (() => void) | undefined;
   let startPromise: Promise<void> | null = null;
   let bridgeError: string | undefined;
+  /**
+   * 待处理的微信 /new 请求：派发方与内部命令 handler 在同一扩展实例内交接（adr/0014）。
+   * `at` 用于丢弃残留请求——`pi.sendUserMessage` 是「发后不管」，handler 若未被执行则无人清空。
+   */
+  let pendingNewRequest: { msg: IncomingMessage; at: number } | null = null;
+  const PENDING_NEW_REQUEST_TTL_MS = 30_000;
 
   // 配置 + 命令穿透（adr/0007）
   let userConfig: UserConfig = defaultUserConfig();
@@ -223,6 +243,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
     pluginDescriptions = new Map<string, string>();
     for (const c of pi.getCommands()) {
       if (c.name === "wechat" || c.name === "wechat-setting") continue;
+      if (c.name === INTERNAL_NEW_COMMAND) continue;
       if (!(await isPassthroughEligible(c))) continue;
       pluginSources.set(c.name.toLowerCase(), c.source);
       pluginDescriptions.set(c.name.toLowerCase(), c.description ?? "");
@@ -271,6 +292,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
     }
     for (const c of pi.getCommands()) {
       if (c.name === "wechat" || c.name === "wechat-setting") continue;
+      if (c.name === INTERNAL_NEW_COMMAND) continue;
       if (!(await isPassthroughEligible(c))) continue;
       items.push({
         id: c.name.toLowerCase(),
@@ -450,6 +472,15 @@ export default function wechatBridge(pi: ExtensionAPI) {
       lines.push("Context: unknown");
     }
     if (lines.length === 0) lines.push("No usage data yet.");
+    // 远端豁免状态（adr/0014）：只有 armed 时 /new、/fork 才不会被 TUI 确认框拦住。
+    const gateMode = confirmGateMode();
+    lines.push(
+      gateMode === "armed"
+        ? "Exemption: armed — TUI confirmations auto-answer"
+        : gateMode === "licensed-idle"
+          ? "Exemption: licensed-idle — WeChat bridge not connected"
+          : "Exemption: off — start pi with --unattended-confirm",
+    );
     const bridge = formatBridgeCounters(metrics.snapshot());
     if (bridge) lines.push(bridge);
     return lines.join("\n");
@@ -584,18 +615,74 @@ export default function wechatBridge(pi: ExtensionAPI) {
 
   // ── Native command handlers ──────────────────────────────────────────
 
+  /**
+   * 真正的 /new：由内部命令 handler 调用，拿到的是**命令级** ctx（含 newSession）。
+   *
+   * 为什么绕一圈：pi 1.4 把 newSession/switchSession/fork 只挂在 ExtensionCommandContext 上，
+   * 而桥日常持有的是事件 ctx（session_start / bot 回调）——会话替换后重连的实例里
+   * `ctx.newSession` 根本不存在。详见 adr/0014。
+   */
+  async function performNewSession(cmdCtx: ExtensionCommandContext): Promise<void> {
+    const request = pendingNewRequest;
+    pendingNewRequest = null;
+    // 防误触：TUI 里手敲内部命令不产生任何副作用；过期请求同样丢弃（派发是发后不管，
+    // handler 未被派发时请求会残留，见 adr/0014）。
+    const ageMs = request ? Date.now() - request.at : 0;
+    if (!request || ageMs > PENDING_NEW_REQUEST_TTL_MS) {
+      cmdCtx.ui.notify("wechat-internal-new 仅由微信桥调用，已忽略", "warning");
+      log.warn("internal /new invoked without a live WeChat request", { ageMs });
+      return;
+    }
+
+    const { msg } = request;
+    // 「Starting…」回执已在派发点发出：handler 可能根本跑不到（见 adr/0014 补充 4）。
+    restartAfterReplace = true;
+    pendingAck = {
+      reply: msg,
+      text: "New session started. Previous conversation archived; WeChat connection restored.",
+    };
+
+    try {
+      const result = await cmdCtx.newSession();
+      if (result && result.cancelled) {
+        // pi 侧被某个 session_before_switch handler 取消：会话未替换，必须回滚标志，
+        // 否则下一次真实 session_start 会误触发重连并补发这条过期 ack。
+        restartAfterReplace = false;
+        pendingAck = null;
+        log.info("new session cancelled by extension");
+        await sendTextReply(
+          msg,
+          "New session cancelled. Current session is unchanged.",
+        );
+        return;
+      }
+      log.info("new session started", { via: INTERNAL_NEW_COMMAND });
+    } catch (e) {
+      restartAfterReplace = false;
+      pendingAck = null;
+      await sendTextReply(
+        msg,
+        `Failed to start new session: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  /**
+   * 执行微信端原生命令。
+   * @returns `true` = ctx 已不可再用（`/new` 已派发，会话替换随时发生，调用方必须立即停止访问 ctx）。
+   */
   async function handleNativeCommand(
     id: NativeCommandId,
     msg: IncomingMessage,
-    ctx: ExtensionCommandContext,
-  ): Promise<void> {
+    ctx: ExtensionContext,
+  ): Promise<boolean> {
     const cmd = nativeCommandById(id);
     if (!enabledFor(id, cmd.exempt)) {
       await sendTextReply(
         msg,
         `命令 /${id} 未在微信端启用（用 /wechat-setting 配置）。`,
       );
-      return;
+      return false;
     }
 
     switch (id) {
@@ -610,7 +697,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
         } else {
           await sendTextReply(msg, "No active turn.");
         }
-        return;
+        return false;
       }
       case "compact": {
         if (!ctx.isIdle()) {
@@ -618,7 +705,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
             msg,
             'Cannot compact while pi is busy. Send "stop" first.',
           );
-          return;
+          return false;
         }
         ctx.compact({
           onComplete: () => {
@@ -632,11 +719,11 @@ export default function wechatBridge(pi: ExtensionAPI) {
           },
         });
         await sendTextReply(msg, "Compaction started.");
-        return;
+        return false;
       }
       case "status": {
         await sendTextReply(msg, await buildStatusText(ctx));
-        return;
+        return false;
       }
       case "new": {
         if (!ctx.isIdle()) {
@@ -644,32 +731,95 @@ export default function wechatBridge(pi: ExtensionAPI) {
             msg,
             'Cannot start a new session while pi is busy. Send "stop" first.',
           );
-          return;
+          return false;
         }
+
+        // 远端豁免未生效时，session_before_switch 的 TUI 确认框会永久阻塞本调用（adr/0014）。
+        // 先自检并直接拒绝，别让用户在微信里干等一个永不返回的 /new。
+        const gateMode = confirmGateMode();
+        if (gateMode !== "armed") {
+          // 接口探测本身抛错（例如 selector 侧旧 ctx）与「无许可」是两回事，别给错指引。
+          const probeError = confirmGateLastError();
+          log.warn("new session refused — unattended exemption not armed", {
+            mode: gateMode,
+            probeError,
+          });
+          const reason = probeError
+            ? `the confirm-gate API raised: ${probeError}`
+            : gateMode === "off"
+              ? "Start pi with --unattended-confirm (and make sure the selector extension is installed)."
+              : "The bridge has not armed the exemption yet; check `/unattended status` in the pi terminal.";
+          await sendTextReply(
+            msg,
+            "Cannot start a new session: a TUI confirmation prompt would block it.\n" +
+              `Reason: exemption=${gateMode}. ${reason}`,
+          );
+          return false;
+        }
+
+        // 派发是「发后不管」：命令缺失时 prompt() 会把 /<name> 当普通用户文本送给模型
+        // （真实 turn、烧 token），用户却收不到任何回执。先确认内部命令确实以本名注册
+        // （重名会被消歧成 `wechat-internal-new:1`，见 adr/0014 补充 2/4）。
+        const internalCommandReady = pi
+          .getCommands()
+          .some((c) => c.name === INTERNAL_NEW_COMMAND && c.source === "extension");
+        if (!internalCommandReady) {
+          log.error("internal command unavailable — refusing /new", {
+            command: INTERNAL_NEW_COMMAND,
+          });
+          await sendTextReply(
+            msg,
+            `Cannot start a new session: the bridge's internal command /${INTERNAL_NEW_COMMAND} is not registered (another extension may have taken the name). Restart pi and check for extension conflicts.`,
+          );
+          return false;
+        }
+
+        // 单槽 pendingNewRequest：覆盖会让两条 /new 的回执对象错配、后一条被静默吞掉。
+        if (
+          pendingNewRequest &&
+          Date.now() - pendingNewRequest.at <= PENDING_NEW_REQUEST_TTL_MS
+        ) {
+          await sendTextReply(
+            msg,
+            "A /new request is already in progress — wait a few seconds and retry.",
+          );
+          return false;
+        }
+
+        // 会话控制方法只存在于命令 ctx；事件 ctx（session_start 等）没有 newSession。
+        // 唯一官方通道是把内部命令经 sendUserMessage 派发：pi 用 runner.createCommandContext()
+        // 调它的 handler（agent-session.js `_tryExecuteExtensionCommand`），拿到新鲜命令 ctx。
+        pendingNewRequest = { msg, at: Date.now() };
+        // 「已受理」回执放在派发点而不是 handler 里：handler 可能永远不执行（命令缺失、
+        // 实例被替换、并发 /new），留在 handler 里就退化成「发了 /new 没反应」。
+        // 放在 sendUserMessage 之前也保证回执顺序先于 ack（adr/0014 补充 4）。
+        log.debug("new session request dispatched", {
+          command: INTERNAL_NEW_COMMAND,
+        });
         await sendTextReply(
           msg,
           "Starting a new session — the bridge will reconnect automatically…",
         );
-        restartAfterReplace = true;
-        pendingAck = {
-          reply: msg,
-          text: "New session started. Previous conversation archived; WeChat connection restored.",
-        };
         try {
-          await ctx.newSession();
+          // pi.sendUserMessage() 返回 void（发后不管），替换完成时机不可知；
+          // 因此派发后一律不再触碰 ctx，由返回值 true 告知调用方（见 adr/0014）。
+          pi.sendUserMessage(`/${INTERNAL_NEW_COMMAND}`, {
+            expandPromptTemplates: true,
+          });
         } catch (e) {
-          restartAfterReplace = false;
-          pendingAck = null;
+          // 只有同步抛出（例如扩展实例已失效的 assertActive）能在这里观察到。
+          pendingNewRequest = null;
           await sendTextReply(
             msg,
             `Failed to start new session: ${e instanceof Error ? e.message : String(e)}`,
           );
+          return false;
         }
-        return;
+        return true;
       }
       case "help": {
         await sendTextReply(msg, helpText());
-        return;
+        return false;
       }
     }
   }
@@ -679,7 +829,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
   async function handlePluginCommand(
     intent: Extract<CommandIntent, { kind: "plugin" }>,
     msg: IncomingMessage,
-    ctx: ExtensionCommandContext,
+    ctx: ExtensionContext,
   ): Promise<void> {
     if (!enabledFor(intent.name, false)) {
       await sendTextReply(
@@ -738,7 +888,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
 
   async function dispatchMessage(
     msg: IncomingMessage,
-    ctx: ExtensionCommandContext,
+    ctx: ExtensionContext,
   ): Promise<void> {
     if (!bot || !connected) {
       log.warn("message dropped — bridge not connected", {
@@ -798,7 +948,10 @@ export default function wechatBridge(pi: ExtensionAPI) {
     );
 
     if (intent.kind === "native") {
-      await handleNativeCommand(intent.id, msg, ctx);
+      // /new 派发后会话随时会被替换、旧 ctx 随即 invalidate（pi 1.4 dispose →
+      // runner.invalidate），而替换完成时机不可观测（sendUserMessage 是发后不管）。
+      // 因此由返回值告知「ctx 已不可再用」，直接退出，别再用 stale ctx 刷状态。
+      if (await handleNativeCommand(intent.id, msg, ctx)) return;
       updateStatus(ctx);
       return;
     }
@@ -1095,7 +1248,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
 
   // ── /wechat command ──────────────────────────────────────────────────
 
-  const startWechat = async (_args: string | undefined, ctx: any) => {
+  const startWechat = async (_args: string | undefined, ctx: ExtensionContext) => {
     if (connected && bot) {
       const action = await ctx.ui.select("WeChat is connected", [
         "Reconnect",
@@ -1156,6 +1309,19 @@ export default function wechatBridge(pi: ExtensionAPI) {
       });
 
       connected = true;
+      // 占用远端豁免（adr/0014）：连接期间没有真人在 TUI 前，selector 的确认框按调用点
+      // 声明的默认值直接放行。解除函数由 shutdownBot / 登录失败路径释放（幂等）。
+      // 先释放再占用：登录中重复执行 /wechat 时不能覆盖上一份解除函数（否则引用计数泄漏，
+      // selector 侧永远保持 armed）。
+      releaseConfirmGate();
+      disarmConfirmGate = armConfirmGate("wechat");
+      if (disarmConfirmGate) {
+        log.info("confirm gate armed", { owner: "wechat" });
+      } else {
+        log.warn("confirm gate not armed — TUI confirmations may block /new", {
+          mode: confirmGateMode(),
+        });
+      }
       connecting = false;
       bridgeError = undefined;
       welcomedUsers.clear();
@@ -1191,6 +1357,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
       startPromise = bot.start().catch((e) => {
         bridgeError = e instanceof Error ? e.message : String(e);
         connected = false;
+        releaseConfirmGate();
         updateStatus(ctx);
       });
 
@@ -1201,6 +1368,7 @@ export default function wechatBridge(pi: ExtensionAPI) {
     } catch (e) {
       connecting = false;
       connected = false;
+      releaseConfirmGate();
       bridgeError = e instanceof Error ? e.message : String(e);
       updateStatus(ctx);
       ctx.ui.notify(
@@ -1211,7 +1379,28 @@ export default function wechatBridge(pi: ExtensionAPI) {
     }
   };
 
+  /** 释放远端豁免占用（幂等）。断开 / 登录失败 / 会话替换都会走到这里（adr/0014）。 */
+  function releaseConfirmGate(): void {
+    const disarm = disarmConfirmGate;
+    if (!disarm) return;
+    // 先摘引用再调用：解除函数可能抛错（selector 侧 stale ctx，见 adr/0014 补充 1），
+    // 若在调用之后才清空，坏引用会被重放、引用计数永久不降（违背 D2）。
+    disarmConfirmGate = undefined;
+    try {
+      disarm();
+    } catch (e) {
+      // 已处在断开边界（shutdown/登录失败），没有可返回的错误通道；占用的解除只是
+      // 「恢复 TUI 人工确认」的优化，记录后继续清理，不能让 bot 停不下来。
+      log.warn("confirm gate disarm failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return;
+    }
+    log.info("confirm gate disarmed", { owner: "wechat" });
+  }
+
   async function shutdownBot(): Promise<void> {
+    releaseConfirmGate();
     await gracefulStop(bot, startPromise);
     bot = null;
     connected = false;
@@ -1225,6 +1414,14 @@ export default function wechatBridge(pi: ExtensionAPI) {
     startPromise = null;
     bridgeError = undefined;
   }
+
+  // 内部命令：微信 /new 的唯一执行入口（会话控制只存在于命令 ctx，见 adr/0014）。
+  pi.registerCommand(INTERNAL_NEW_COMMAND, {
+    description: "（内部）微信桥专用 /new 通道，请勿直接调用",
+    handler: async (_args, cmdCtx) => {
+      await performNewSession(cmdCtx);
+    },
+  });
 
   pi.registerCommand("wechat", {
     description: "Connect WeChat — scan QR to chat with Pi from your phone",

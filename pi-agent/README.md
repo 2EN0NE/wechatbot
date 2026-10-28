@@ -88,6 +88,48 @@ cp -r . ~/.pi/agent/extensions/wechat/
 
 pi 处理一个轮次时若超过阈值（默认 180 秒，可在 `/wechat-setting` 配置）无任何进展（无消息/工具更新），桥会向微信发送一次提示，附上最新流式回复文本，并提示可发送 `stop` 中止；不自动中止。每轮至多提示一次。
 
+### 远端豁免（`/new` 不被 TUI 确认框拦住）
+
+微信发起 `/new` 会走 `ctx.newSession()`，pi 随即触发 `session_before_switch`，
+`confirm-destructive`、`dirty-repo-guard` 等扩展会在终端弹确认框——没人按键就**永久阻塞**。
+桥通过「远端豁免」避免这一点：pi 以 `--unattended-confirm` 启动授予许可，桥在微信连接就绪时
+`arm("wechat")` 占用豁免，断开即释放；占用期间这些对话框按声明默认值自动放行。
+
+前置条件（两条都满足才生效）：
+
+1. `@zenone/pi-selector` 等扩展已同步到 `~/.pi/agent/extensions/`（提供 `globalThis.__confirmGateApi`）；
+2. pi 启动命令带 `--unattended-confirm`（写在 tmux 启动行 / 别名 / org `launchArgs` 里，不要每次手打）。
+
+自查与行为：
+
+- pi 终端 `/unattended status` → `armed`（微信连接中）/ `licensed-idle`（有许可未连接）/ `off`（未授权）；
+- 微信 `/status` 追加一行 `Exemption: armed | licensed-idle | off`；
+- 未生效时微信 `/new` **直接回执拒绝并说明原因**（不再挂起），`/compact`、`stop`、普通消息不受影响；
+- 占用期间这是**全进程**行为：终端里人工操作 selector 也被自动放行；`/unattended disarm` 可立刻恢复。
+
+日志（`~/.pi/logs/wechat_<YYYYMMDD>.log`）关键行：`confirm gate armed` / `confirm gate disarmed` /
+`confirm gate disarm failed` / `new session refused — unattended exemption not armed` /
+`new session request dispatched`（已受理）/ `internal command unavailable — refusing /new` /
+`new session cancelled by extension` / `internal /new invoked without a live WeChat request`（残留请求被丢弃）。
+
+注意：`/unattended` 是 **pi 终端的扩展命令**，微信端发它不会执行（会被当作普通消息），
+微信侧请用 `/status`（需先在 `/wechat-setting` 开启）或看拒绝回执/日志。
+
+`/new` 的执行入口是内部命令 `wechat-internal-new`：pi 1.4 的 `newSession` 只存在于命令 ctx，
+桥通过 `sendUserMessage(..., { expandPromptTemplates: true })` 派发它来拿到新鲜命令 ctx。
+该 API **返回 void（发后不管）**，派发完成时机不可知，因此派发后桥不再访问 ctx；
+TUI 自动补全里能看到这个名字，**勿手敲**（无待处理微信请求时它只提示并返回，超过 30s 的
+残留请求同样按无请求处理）。
+
+派发前桥做两项自检：内部命令是否真以本名注册（重名会被 pi 消歧成 `wechat-internal-new:1`，
+查不到就明确回执拒绝，而不是把它当普通消息送给模型烧 token）；是否已有未过期的在飞 `/new`
+（第二条直接回执 `already in progress`）。`Starting a new session…` 回执在**派发点**发出，
+不依赖 handler 是否真的执行（见 `docs/adr/0014` 补充 4）。
+
+pi 1.4 起会话替换后**旧 ctx 立即失效**：若在日志里看到
+`Login failed: This extension ctx is stale …` 或 `Handler error: … stale …`，说明有代码在
+`ctx.newSession()` 返回后继续使用旧 ctx（已在本版本修复，见 `docs/adr/0014` 补充 3）。
+
 ### 回文件给微信（`wechat_attach` 工具）
 
 agent 需要把文件（图片 / 视频 / 文档）发回微信时，调用 `wechat_attach` 工具并传入本地文件路径即可；扩展会在下一轮回复里把文件随文本一起发出（按 MIME 自动路由 image / video / file）。不要只在正文里写路径——那样不会发送。

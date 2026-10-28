@@ -75,3 +75,14 @@ _Avoid_: WAL, log file
 **Replay（回放）**：
 崩溃恢复后把 Journal 中「已准入未结算」的记录重新当作一个 turn 处理，语义为至少一次。
 _Avoid_: 仿真, resume, 重放消息
+
+**Remote exemption（远端豁免）**：
+pi 以 `--unattended-confirm` 启动授予许可后，远端通道（微信桥）用 `arm(owner)` 占用的一种模式；
+生效期间 selector 的确认对话框不弹框，改按调用点声明的默认值放行（未声明则取消）。
+通道断开即 `disarm()`，立刻恢复人工确认。
+_Avoid_: auto-confirm, skip-all, yolo mode
+
+**Confirm gate（确认闸门）**：
+selector 暴露的通道无关弱桥接 `globalThis.__confirmGateApi`（`hasLicense` / `isArmed` / `arm`）。
+本仓库只读它判断「现在能不能安全地发起 `/new`」，不依赖 `@zenone/pi-selector` 包。
+_Avoid_: selector API, dialog hook
