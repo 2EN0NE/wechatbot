@@ -22,7 +22,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      # 用 lockfile 确定性安装：npm 10 对 vitest 4 的 peer 集合会在全新解析时
+      # 触发 arborist 崩溃（Cannot read properties of null (reading 'edgesOut')）
+      - run: npm ci
       - run: npm run build
       - run: npx vitest run
         env:

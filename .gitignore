@@ -6,8 +6,10 @@ tmp/
 .next/
 next-env.d.ts
 target/
+# lockfile 入库（SDK 与 pi-agent 两包）+ CI 用 npm ci，避免每次全新解析
 package-lock.json
 !pi-agent/package-lock.json
+!nodejs/package-lock.json
 .scratch/
 .pi/logs/
 .pi/extensions-data/
